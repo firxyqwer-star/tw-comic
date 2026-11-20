@@ -1,0 +1,11 @@
+{
+  "display_name": "漫画工作台",
+  "loading_order": 100,
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Sol · user workspace",
+  "version": "0.2.7",
+  "auto_update": false,
+  "minimum_client_version": "1.18.0",
+  "hooks": { "disable": "onDisable", "clean": "onDelete", "delete": "onDelete", "enable": "onEnable" }
+}
