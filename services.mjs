@@ -29,7 +29,26 @@ export function checkHost(ctx) {
 export async function planWithCurrentConnection(ctx, { source, appearance = '', style = '', responseLength = 12000, references = null }) {
     if (typeof ctx.generateRaw !== 'function') throw new Error('当前酒馆未提供 generateRaw 规划接口。');
     const segments = segmentSource(source);
-    const raw = await ctx.generateRaw(plannerRequest(segments, appearance, style, responseLength, references));
+    const request = plannerRequest(segments, appearance, style, responseLength, references);
+    const events = ctx.eventSource;
+    const ready = ctx.eventTypes?.CHAT_COMPLETION_SETTINGS_READY;
+    const canScopeRequest = ready && typeof events?.on === 'function' && typeof events.removeListener === 'function';
+    const disableDeepSeekThinking = payload => {
+        if (payload?.type !== 'quiet' || payload.chat_completion_source !== 'deepseek') return;
+        if (!payload.messages?.some(message => message.role === 'system' && message.content === request.systemPrompt)) return;
+        payload.include_reasoning = false;
+        delete payload.reasoning_effort;
+    };
+    if (canScopeRequest) events.on(ready, disableDeepSeekThinking);
+    let raw;
+    try {
+        raw = await ctx.generateRaw(request);
+    } finally {
+        if (canScopeRequest) events.removeListener(ready, disableDeepSeekThinking);
+    }
+    if (raw == null || (typeof raw === 'string' && !raw.trim())) {
+        throw new Error('模型没有返回分镜 JSON。请检查当前模型的推理模式和输出上限，或换用能直接输出正文的模型后重试。');
+    }
     const plan = validatePlan(raw, segments.length);
     return { plan, warnings: [...dialogueWarnings(source, plan), ...plan.notes.map(note => `人物资料核对：${note}`)], segments };
 }

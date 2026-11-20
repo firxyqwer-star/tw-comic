@@ -48,6 +48,12 @@ function capture(index) {
     return { chatId: ctx.chatId, characterId: ctx.characterId, groupId: ctx.groupId, index, message, text: message.mes, swipe: message.swipe_id ?? 0 };
 }
 function current(bound) { return !runtime?.destroyed && bindingMatches(context(), bound); }
+function newComicId() {
+    if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    // 局域网 HTTP 页面也可以使用 getRandomValues。
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+}
 function recordFor(bound) {
     return bound.message.extra?.[ID]?.variants?.findLast(r => r.original === bound.text && r.swipe === bound.swipe);
 }
@@ -483,7 +489,7 @@ async function openEditor(index) {
         const planningContext = references.reused.length ? { ...references.context, cachedCharacterProfiles: references.reused } : references.context;
         const result = await planWithCurrentConnection(context(), { source: source.value, appearance: appearance.value, style: style.value, responseLength: settings().responseLength, references: planningContext });
         if (!current(bound) || halted) throw new Error('任务已停止或聊天已变化，未写入规划结果。');
-        record = { id: crypto.randomUUID(), original: bound.text, swipe: bound.swipe, source: source.value, appearance: appearance.value, style: style.value, sourceOptions: sourceOptions(), referenceContext: references.context, referenceReceipt: references.receipt, referenceWarnings: references.warnings, plan: result.plan, warnings: [...references.warnings, ...result.warnings], pages: result.plan.pages.map((_, i) => ({ prompt: buildPagePrompt(result.plan, i, style.value, appearance.value), status: 'pending' })) };
+        record = { id: newComicId(), original: bound.text, swipe: bound.swipe, source: source.value, appearance: appearance.value, style: style.value, sourceOptions: sourceOptions(), referenceContext: references.context, referenceReceipt: references.receipt, referenceWarnings: references.warnings, plan: result.plan, warnings: [...references.warnings, ...result.warnings], pages: result.plan.pages.map((_, i) => ({ prompt: buildPagePrompt(result.plan, i, style.value, appearance.value), status: 'pending' })) };
         selectedStory = 0; selectedOutput = 0;
         await persist(); renderPlan(); showStage(1);
         status.textContent = `已规划 ${record.pages.length} 页。请核对分镜和对白。`;
