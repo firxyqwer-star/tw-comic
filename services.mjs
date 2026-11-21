@@ -49,7 +49,7 @@ export async function planWithCurrentConnection(ctx, { source, appearance = '', 
     if (raw == null || (typeof raw === 'string' && !raw.trim())) {
         throw new Error('模型没有返回分镜 JSON。请检查当前模型的推理模式和输出上限，或换用能直接输出正文的模型后重试。');
     }
-    const plan = validatePlan(raw, segments.length);
+    const plan = validatePlan(raw, segments.length, { requireDetailedScenes: true });
     return { plan, warnings: [...dialogueWarnings(source, plan), ...plan.notes.map(note => `人物资料核对：${note}`)], segments };
 }
 
