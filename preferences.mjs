@@ -7,6 +7,7 @@ export const DEFAULT_STYLE = "Contemporary Japanese fantasy gacha character spla
 export const DEFAULT_PREFERENCES = Object.freeze({
     drawingBackend: 'off', comfyUrl: '', webuiUrl: '', novelModel: 'nai-diffusion-4-5-full',
     useLegacyWorkflow: false, responseLength: 20000, planningOutputBudgetUpdated: true, style: DEFAULT_STYLE,
+    storyboardRules: '', imageTemplates: { multi: '', single: '' },
     appearance: '', workflow: null, workflowBindings: {}, useBaiBai: true, useWorldbook: true,
 });
 export function upgradePreferences(saved) {

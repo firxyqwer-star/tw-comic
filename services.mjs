@@ -1,4 +1,4 @@
-import { segmentSource, plannerRequest, validatePlan, dialogueWarnings, normalizeImagePath } from './core.mjs';
+import { segmentSource, plannerRequest, sceneDetailRequest, applySceneDetails, validatePlan, dialogueWarnings, normalizeImagePath } from './core.mjs';
 
 let hostStateModule;
 const loadHostStateModule = () => hostStateModule ??= import('/script.js').catch(error => {
@@ -26,10 +26,8 @@ export function checkHost(ctx) {
     if (missing.length) throw new Error(`当前酒馆缺少所需接口：${missing.join('、')}。请核对 TauriTavern 版本。`);
 }
 
-export async function planWithCurrentConnection(ctx, { source, appearance = '', style = '', responseLength = 12000, references = null }) {
+async function runPlanningRequest(ctx, request) {
     if (typeof ctx.generateRaw !== 'function') throw new Error('当前酒馆未提供 generateRaw 规划接口。');
-    const segments = segmentSource(source);
-    const request = plannerRequest(segments, appearance, style, responseLength, references);
     const events = ctx.eventSource;
     const ready = ctx.eventTypes?.CHAT_COMPLETION_SETTINGS_READY;
     const canScopeRequest = ready && typeof events?.on === 'function' && typeof events.removeListener === 'function';
@@ -49,8 +47,19 @@ export async function planWithCurrentConnection(ctx, { source, appearance = '', 
     if (raw == null || (typeof raw === 'string' && !raw.trim())) {
         throw new Error('模型没有返回分镜 JSON。请检查当前模型的推理模式和输出上限，或换用能直接输出正文的模型后重试。');
     }
+    return raw;
+}
+
+export async function planWithCurrentConnection(ctx, { source, appearance = '', style = '', responseLength = 12000, references = null, storyboardRules = '' }) {
+    const segments = segmentSource(source);
+    const raw = await runPlanningRequest(ctx, plannerRequest(segments, appearance, style, responseLength, references, storyboardRules));
     const plan = validatePlan(raw, segments.length);
     return { plan, warnings: [...dialogueWarnings(source, plan), ...plan.notes.map(note => `人物资料核对：${note}`)], segments };
+}
+
+export async function detailScenesWithCurrentConnection(ctx, { plan, frames, source, appearance, responseLength }) {
+    const raw = await runPlanningRequest(ctx, sceneDetailRequest(plan, frames, source, appearance, responseLength));
+    return applySceneDetails(plan, frames, raw);
 }
 
 async function post(ctx, path, body, request, signal) {

@@ -1,8 +1,8 @@
-import { segmentSource, validatePlan, sceneIssues, dialogueWarnings, buildPagePrompt, buildSingleFramePrompt, singleFrames, fillWorkflow, workflowNodes, prepareComfyWorkflow, COMFY_WORKFLOW_FIELDS, bindingMatches, runPages } from './core.mjs';
-import { checkHost, planWithCurrentConnection, generateImage, normalizeComfyUrl, testComfyConnection, testNovelConnection, testWebUiConnection, readHostGenerationState, saveNovelKey } from './services.mjs';
+import { segmentSource, validatePlan, sceneIssues, shortSceneBatch, dialogueWarnings, DIALOGUE_WARNING_PREFIX, buildPagePrompt, buildSingleFramePrompt, singleFrames, DEFAULT_STORYBOARD_RULES, DEFAULT_IMAGE_TEMPLATES, validateImageTemplate, fillWorkflow, workflowNodes, prepareComfyWorkflow, COMFY_WORKFLOW_FIELDS, bindingMatches, runPages } from './core.mjs';
+import { checkHost, planWithCurrentConnection, detailScenesWithCurrentConnection, generateImage, normalizeComfyUrl, testComfyConnection, testNovelConnection, testWebUiConnection, readHostGenerationState, saveNovelKey } from './services.mjs';
 import { collectReferences } from './references.mjs';
 import { cleanCharacterProfiles, observedProfiles, reuseCharacterProfiles } from './character-cache.mjs';
-import { LEGACY_STYLE, upgradePreferences } from './preferences.mjs';
+import { DEFAULT_PREFERENCES, LEGACY_STYLE, upgradePreferences } from './preferences.mjs';
 
 const ID = 'tw_comic';
 const RUNTIME = '__twComicRuntime';
@@ -406,15 +406,13 @@ function mountSettings() {
     const useBaiBai = toggle(box, '读取柏宝书资料（只读）', config.useBaiBai);
     const useWorldbook = toggle(box, '读取世界书资料（只读）', config.useWorldbook);
     box.append(el('p', 'twc-help', '两个开关互相独立，作为新规划的默认值。世界书读取当前角色、群组角色、聊天与全局绑定书的匹配条目；不会执行原生触发器或宏。'));
-    const length = field(box, '规划输出上限（token）', config.responseLength, false); length.type = 'number'; length.min = '1024'; length.max = '64000';
+    box.append(el('p', 'twc-help', '分镜提示词、出图模板和输出上限可在工作台的「规则」页调整。'));
     const style = field(box, '默认画风', config.style);
     const appearance = field(box, '共用人物外观（可留空，或每次在预览中填写）', config.appearance);
     const result = el('p', 'twc-status'); result.setAttribute('role', 'status');
     box.append(button('保存设置', () => {
         try {
-            const limit = Number(length.value);
-            if (!Number.isInteger(limit) || limit < 1024 || limit > 64000) throw new Error('输出上限应为 1024～64000 的整数，并受当前模型实际支持范围限制。');
-            Object.assign(config, { responseLength: limit, style: style.value, appearance: appearance.value, useBaiBai: useBaiBai.checked, useWorldbook: useWorldbook.checked });
+            Object.assign(config, { style: style.value, appearance: appearance.value, useBaiBai: useBaiBai.checked, useWorldbook: useWorldbook.checked });
             context().saveSettingsDebounced(); result.textContent = '设置已保存。';
         } catch (error) { result.textContent = error.message; }
     }), result);
@@ -440,13 +438,13 @@ async function openEditor(index) {
     const close = button('关闭', () => { dialog.close(); }); heading.append(close); dialog.append(heading);
     const nav = el('nav', 'twc-stages'); nav.setAttribute('aria-label', '漫画制作步骤'); dialog.append(nav);
     const main = el('div', 'twc-workspace-main'); dialog.append(main);
-    const stages = ['准备', '分镜', '出图'].map((label, index) => {
+    const stages = ['准备', '分镜', '出图', '规则'].map((label, index) => {
         const panel = el('section', 'twc-stage'); panel.id = `twc-stage-${index}`; main.append(panel);
         const tab = button(label, () => showStage(index), 'twc-stage-tab');
         tab.setAttribute('aria-controls', panel.id); nav.append(tab);
         return { panel, tab };
     });
-    const [prep, story, output] = stages.map(stage => stage.panel);
+    const [prep, story, output, rules] = stages.map(stage => stage.panel);
     function showStage(active) {
         for (const [index, { panel, tab }] of stages.entries()) {
             panel.hidden = index !== active;
@@ -485,6 +483,50 @@ async function openEditor(index) {
     mountDrawingSettings(prep, config);
     const footer = el('footer', 'twc-footer'); dialog.append(footer);
     const status = el('p', 'twc-status'); status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite'); footer.append(status);
+    const ruleBox = el('section', 'twc-surface'); rules.append(ruleBox);
+    const responseLimit = field(ruleBox, 'AI 输出上限（token）', config.responseLength, false);
+    responseLimit.type = 'number'; responseLimit.min = '1024'; responseLimit.max = '64000';
+    ruleBox.append(el('p', 'twc-help', '用于规划分页和 AI 补写，实际可用上限取决于当前模型。'));
+    const plannerRules = field(ruleBox, '分镜提示词', config.storyboardRules || DEFAULT_STORYBOARD_RULES); plannerRules.rows = 10;
+    ruleBox.append(el('p', 'twc-help', '插件会自动附上 JSON 格式、段落编号和每格最低字数要求。'));
+    const templateBoxes = {};
+    for (const [mode, label, keys] of [
+        ['multi', '多格生图提示词', '{{分镜}} 必填。可用 {{画风}}、{{人物}}、{{页码}}、{{总页数}}、{{标题}}、{{格数}}、{{情绪}}。'],
+        ['single', '单格生图提示词', '{{画面}} 和 {{文字}} 必填。可用 {{画风}}、{{人物}}、{{标题}}、{{情绪}}。'],
+    ]) {
+        templateBoxes[mode] = field(ruleBox, label, config.imageTemplates?.[mode] || DEFAULT_IMAGE_TEMPLATES[mode]);
+        templateBoxes[mode].rows = 7;
+        ruleBox.append(el('p', 'twc-help', keys));
+    }
+    const ruleActions = el('div', 'twc-actions'); ruleBox.append(ruleActions);
+    const saveRules = button('保存规则', () => {
+        try {
+            const limit = Number(responseLimit.value);
+            if (!Number.isInteger(limit) || limit < 1024 || limit > 64000) throw new Error('输出上限应为 1024～64000 的整数。');
+            const multi = templateBoxes.multi.value.trim() || DEFAULT_IMAGE_TEMPLATES.multi;
+            const single = templateBoxes.single.value.trim() || DEFAULT_IMAGE_TEMPLATES.single;
+            validateImageTemplate(multi, 'multi'); validateImageTemplate(single, 'single');
+            config.storyboardRules = plannerRules.value.trim() === DEFAULT_STORYBOARD_RULES ? '' : plannerRules.value.trim();
+            config.imageTemplates = { multi: multi === DEFAULT_IMAGE_TEMPLATES.multi ? '' : multi, single: single === DEFAULT_IMAGE_TEMPLATES.single ? '' : single };
+            config.responseLength = limit;
+            context().saveSettingsDebounced();
+            status.textContent = '规则已保存，下次规划会使用新规则。';
+        } catch (error) { status.textContent = error.message; }
+    }, 'twc-primary');
+    const resetRules = button('恢复默认', () => {
+        responseLimit.value = DEFAULT_PREFERENCES.responseLength;
+        plannerRules.value = DEFAULT_STORYBOARD_RULES;
+        templateBoxes.multi.value = DEFAULT_IMAGE_TEMPLATES.multi;
+        templateBoxes.single.value = DEFAULT_IMAGE_TEMPLATES.single;
+        status.textContent = '已填入默认值，点击「保存规则」生效。';
+    });
+    const applyTemplates = button('将已保存的模板应用到当前分镜', () => withBusy(async () => {
+        ensureFresh();
+        if (!record || hasUnsavedPlanEdits()) throw new Error('请先保存当前分镜中的修改。');
+        await savePlanEdits(record.plan, config.imageTemplates);
+        status.textContent = '当前分镜的生图提示词已更新。';
+    }));
+    ruleActions.append(saveRules, resetRules, applyTemplates);
     const warningBox = el('div', 'twc-warnings'); story.append(warningBox);
     const storyEmpty = el('p', 'twc-empty', '先在「准备」中规划分页。'); story.append(storyEmpty);
     const recovery = el('details', 'twc-disclosure');
@@ -516,6 +558,23 @@ async function openEditor(index) {
     }));
     recovery.append(restoreButton); story.append(recovery);
     const planBox = el('div', 'twc-plan'); story.append(planBox);
+    const detailActions = el('div', 'twc-actions'); planBox.append(detailActions);
+    const detailHint = el('p', 'twc-help');
+    const detailButton = button('AI 补写动作细节', () => withBusy(async () => {
+        ensureFresh();
+        if (!record || hasUnsavedPlanEdits()) throw new Error('请先保存分镜和准备页中的修改。');
+        const frames = shortSceneBatch(record.plan);
+        if (!frames.length) return;
+        status.textContent = `正在用酒馆当前模型补写 ${frames.length} 格画面描述。`;
+        const result = await detailScenesWithCurrentConnection(context(), { plan: record.plan, frames, source: record.source, appearance: record.appearance, responseLength: settings().responseLength });
+        ensureFresh();
+        if (halted || !dialog.open) return;
+        if (!result.count) throw new Error('模型没有补到 50 字，原分镜已保留。');
+        await savePlanEdits(result.plan);
+        const remaining = singleFrames(record.plan).filter(({ panel }) => sceneIssues(panel.scene).length).length;
+        status.textContent = `已补写 ${result.count} 格。${remaining ? `还有 ${remaining} 格未达到 50 字。` : '所有画面描述已达 50 字。'}`;
+    }), 'twc-primary');
+    detailActions.append(detailHint, detailButton);
     const storyGrid = el('div', 'twc-story-grid'); planBox.append(storyGrid);
     const storyRail = el('div', 'twc-story-rail'); const storyPage = el('article', 'twc-story-page twc-surface'); storyGrid.append(storyRail, storyPage);
     const advanced = el('details', 'twc-disclosure'); advanced.append(el('summary', '', '高级编辑')); planBox.append(advanced);
@@ -584,7 +643,7 @@ async function openEditor(index) {
         if (busy) throw new Error('资料已读取，但酒馆开始了其他生成请求；请等待结束后再规划。');
         status.textContent = '正在使用酒馆当前连接规划，请等待。不会发送正常角色回复。';
         const planningContext = references.reused.length ? { ...references.context, cachedCharacterProfiles: references.reused } : references.context;
-        const result = await planWithCurrentConnection(context(), { source: source.value, appearance: appearance.value, style: style.value, responseLength: settings().responseLength, references: planningContext });
+        const result = await planWithCurrentConnection(context(), { source: source.value, appearance: appearance.value, style: style.value, responseLength: config.responseLength, references: planningContext, storyboardRules: config.storyboardRules });
         if (!current(bound) || halted) throw new Error('任务已停止或聊天已变化，未写入规划结果。');
         await saveNewPlan(result.plan, references, result.warnings);
         const count = scenesToReview().size;
@@ -600,7 +659,8 @@ async function openEditor(index) {
                 : '酒馆当前空闲，可以规划分页。检查状态未调用模型。';
         } catch (error) { if (!owner.destroyed && runtime === owner) status.textContent = error.message; }
     });
-    controls.push(planButton, generateAll, exportButton, planSave, checkState, readButton, useBaiBai, useWorldbook, multiFormat, singleFormat, recoveryInput, restoreButton);
+    controls.push(planButton, generateAll, exportButton, planSave, checkState, readButton, useBaiBai, useWorldbook, multiFormat, singleFormat, recoveryInput, restoreButton, detailButton);
+    controls.push(responseLimit, plannerRules, ...Object.values(templateBoxes), saveRules, resetRules, applyTemplates);
     sources.append(readButton);
     prepActions.append(el('p', 'twc-help', '规划会使用酒馆当前模型连接。'), planButton);
     options.append(exportButton, checkState);
@@ -615,7 +675,8 @@ async function openEditor(index) {
     }
     async function saveNewPlan(plan, references, warnings = [...dialogueWarnings(source.value, plan), ...plan.notes.map(note => `人物资料核对：${note}`)]) {
         const referenceWarnings = references?.warnings ?? [];
-        record = { id: newComicId(), original: bound.text, swipe: bound.swipe, source: source.value, appearance: appearance.value, style: style.value, sourceOptions: sourceOptions(), referenceContext: references?.context, referenceReceipt: references?.receipt, referenceWarnings, reviewScenes: true, plan, warnings: [...referenceWarnings, ...warnings], pages: plan.pages.map((_, i) => ({ prompt: buildPagePrompt(plan, i, style.value, appearance.value), status: 'pending' })) };
+        const promptTemplates = { ...config.imageTemplates };
+        record = { id: newComicId(), original: bound.text, swipe: bound.swipe, source: source.value, appearance: appearance.value, style: style.value, sourceOptions: sourceOptions(), referenceContext: references?.context, referenceReceipt: references?.receipt, referenceWarnings, reviewScenes: true, plan, promptTemplates, warnings: [...referenceWarnings, ...warnings], pages: plan.pages.map((_, i) => ({ prompt: buildPagePrompt(plan, i, style.value, appearance.value, promptTemplates.multi), status: 'pending' })) };
         selectedStory = 0; selectedOutput = 0;
         await persist(); renderPlan(); showStage(1);
     }
@@ -624,22 +685,24 @@ async function openEditor(index) {
     }
     function outputPictures() {
         if (outputMode === 'multi') return record.pages;
-        return record.singlePages ??= singleFrames(record.plan).map(frame => ({ prompt: buildSingleFramePrompt(record.plan, frame, record.style, record.appearance), status: 'pending' }));
+        return record.singlePages ??= singleFrames(record.plan).map(frame => ({ prompt: buildSingleFramePrompt(record.plan, frame, record.style, record.appearance, record.promptTemplates?.single), status: 'pending' }));
     }
     function changeOutputMode(mode) {
         if (!record || mode === outputMode || activeTask) return;
         outputMode = mode; selectedOutput = 0;
         renderOutput();
     }
-    async function savePlanEdits(plan) {
+    async function savePlanEdits(plan, templates = record.promptTemplates) {
         const previousPlan = record.plan;
         const previousStyle = record.style;
         const previousAppearance = record.appearance;
+        const previousTemplates = record.promptTemplates;
         record.plan = plan; record.source = source.value; record.appearance = appearance.value; record.style = style.value;
+        record.promptTemplates = templates ? { ...templates } : undefined;
         record.pages = plan.pages.map((_, i) => {
             const previous = record.pages[i];
-            const prompt = buildPagePrompt(plan, i, record.style, record.appearance);
-            if (previous && previousPlan.pages[i] && prompt === buildPagePrompt(previousPlan, i, previousStyle, previousAppearance)) return previous;
+            const prompt = buildPagePrompt(plan, i, record.style, record.appearance, templates?.multi);
+            if (previous && previousPlan.pages[i] && prompt === buildPagePrompt(previousPlan, i, previousStyle, previousAppearance, previousTemplates?.multi)) return previous;
             return { image: previous?.image, stale: Boolean(previous?.image), prompt, status: 'pending' };
         });
         if (record.singlePages) {
@@ -647,8 +710,8 @@ async function openEditor(index) {
             record.singlePages = singleFrames(plan).map((frame, i) => {
                 const previous = record.singlePages[i];
                 const oldFrame = previousFrames[i];
-                const prompt = buildSingleFramePrompt(plan, frame, record.style, record.appearance);
-                if (previous && oldFrame && prompt === buildSingleFramePrompt(previousPlan, oldFrame, previousStyle, previousAppearance)) return previous;
+                const prompt = buildSingleFramePrompt(plan, frame, record.style, record.appearance, templates?.single);
+                if (previous && oldFrame && prompt === buildSingleFramePrompt(previousPlan, oldFrame, previousStyle, previousAppearance, previousTemplates?.single)) return previous;
                 return { image: previous?.image, stale: Boolean(previous?.image), prompt, status: 'pending' };
             });
         }
@@ -683,6 +746,7 @@ async function openEditor(index) {
         multiFormat.disabled = locked || !record;
         singleFormat.disabled = locked || !record;
         planSave.disabled = locked || !record;
+        applyTemplates.disabled = locked || !record;
         exportButton.disabled = locked || !record;
         for (const node of preview.querySelectorAll('button, textarea')) node.disabled = locked;
         for (const node of storyPage.querySelectorAll('textarea, .twc-save-scene')) node.disabled = locked;
@@ -815,11 +879,15 @@ async function openEditor(index) {
     }
     function renderPlan() {
         planBox.hidden = !record; storyEmpty.hidden = Boolean(record); recovery.hidden = Boolean(record); warningBox.replaceChildren();
+        const short = record ? singleFrames(record.plan).filter(({ panel }) => sceneIssues(panel.scene).length).length : 0;
+        detailActions.hidden = !short;
+        detailHint.textContent = `${short} 格画面不足 50 字。补写会调用酒馆当前模型，一次最多 48 格。`;
         planButton.textContent = record ? '重新规划（替换当前分镜）' : '规划分页';
         if (record) {
             selectedStory = Math.min(selectedStory, record.pages.length - 1);
             planJSON.value = JSON.stringify(record.plan, null, 2);
-            for (const warning of record.warnings ?? []) warningBox.append(el('p', '', warning));
+            const savedWarnings = (record.warnings ?? []).filter(warning => !warning.startsWith(DIALOGUE_WARNING_PREFIX));
+            for (const warning of [...dialogueWarnings(record.source ?? bound.text, record.plan), ...savedWarnings]) warningBox.append(el('p', '', warning));
             renderStoryboard();
         }
         renderOutput(); syncControls();
