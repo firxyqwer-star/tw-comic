@@ -6,11 +6,15 @@ export const MODERN_FANTASY_STYLE = '现代日系幻想手游的高精度二次�
 export const DEFAULT_STYLE = "Contemporary Japanese fantasy gacha character splash-art rendering, applied to each panel of a full-color manga page. Anime-drawn proportions with a slender jaw, narrowed almond-shaped eyes, long fine upper lashes and minimal nose and lip lines. Use a polished 2D painted finish. On faces and clothing, use small closely spaced tonal steps with soft transitions and subtle blue reflected light in shadows. Thin colored contour lines fade along the lit contours. Draw fine individual strands at the ends of hair locks, with narrow silver-blue rim highlights and silky anisotropic sheen. Put the most precise detail into the eyes, hair and metal edges. Irises have clear jewel-like internal facets and pinpoint white catchlights. Keep warm-peach light on the face, cool violet-blue halftones, and a distinct silver-blue rim on the silhouette. Maintain deep midnight-blue shadows and controlled luminous highlights. Render fabric with fine woven texture and smooth folds, with tiny sharp reflections on glass and polished metal. The finish is contemporary game-key-art illustration. Keep broad facial and clothing shadows softly blended, with crisp small details and no flat TV-animation shadow blocks, vintage watercolor texture, thick black outlines or photographic skin texture. Use the specified character appearance, costume, props and location throughout. Keep white panel gutters and render only the quoted dialogue as bubble text.";
 export const DEFAULT_PREFERENCES = Object.freeze({
     drawingBackend: 'off', comfyUrl: '', webuiUrl: '', novelModel: 'nai-diffusion-4-5-full',
-    useLegacyWorkflow: false, responseLength: 12000, style: DEFAULT_STYLE,
+    useLegacyWorkflow: false, responseLength: 20000, planningOutputBudgetUpdated: true, style: DEFAULT_STYLE,
     appearance: '', workflow: null, workflowBindings: {}, useBaiBai: true, useWorldbook: true,
 });
 export function upgradePreferences(saved) {
     let changed = false;
+    if (saved.planningOutputBudgetUpdated === undefined && saved.responseLength === 12000) {
+        saved.responseLength = DEFAULT_PREFERENCES.responseLength;
+        changed = true;
+    }
     if (saved.drawingBackend === undefined) {
         const legacy = saved.comfyEnabled === undefined && typeof saved.comfyUrl === 'string' && Boolean(saved.comfyUrl.trim());
         saved.drawingBackend = (saved.comfyEnabled === true || legacy) ? 'comfy' : 'off';

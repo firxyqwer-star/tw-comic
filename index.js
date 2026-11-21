@@ -1,4 +1,4 @@
-import { segmentSource, validatePlan, dialogueWarnings, buildPagePrompt, fillWorkflow, workflowNodes, prepareComfyWorkflow, COMFY_WORKFLOW_FIELDS, bindingMatches, runPages } from './core.mjs';
+import { segmentSource, validatePlan, sceneIssues, dialogueWarnings, buildPagePrompt, buildSingleFramePrompt, singleFrames, fillWorkflow, workflowNodes, prepareComfyWorkflow, COMFY_WORKFLOW_FIELDS, bindingMatches, runPages } from './core.mjs';
 import { checkHost, planWithCurrentConnection, generateImage, normalizeComfyUrl, testComfyConnection, testNovelConnection, testWebUiConnection, readHostGenerationState, saveNovelKey } from './services.mjs';
 import { collectReferences } from './references.mjs';
 import { cleanCharacterProfiles, observedProfiles, reuseCharacterProfiles } from './character-cache.mjs';
@@ -73,10 +73,72 @@ function download(record) {
     // 浏览器已同步接收下载操作后释放临时 URL。
     setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
-function imageNode(path, label) {
+function imageNode(path, label, openViewer) {
     const link = el('a', 'twc-image-link'); link.href = path; link.target = '_blank'; link.rel = 'noopener';
     const image = el('img', 'twc-image'); image.src = path; image.alt = label; image.loading = 'lazy';
+    if (openViewer) {
+        link.setAttribute('aria-haspopup', 'dialog');
+        link.setAttribute('aria-label', `放大查看${label}`);
+        link.addEventListener('click', event => { event.preventDefault(); openViewer(); });
+    }
     link.append(image); return link;
+}
+function appendPanelText(parent, panel) {
+    if (!panel?.texts.length) return;
+    const lines = el('ul', 'twc-dialogue');
+    lines.setAttribute('aria-label', '分镜对白、旁白与拟声');
+    for (const line of panel.texts) {
+        const label = line.speaker || (line.kind === 'sfx' ? '拟声' : line.kind === 'narration' ? '旁白' : '对白');
+        lines.append(el('li', '', `${label}　${line.text}`));
+    }
+    parent.append(lines);
+}
+function showImageViewer(parent, path, label) {
+    if (parent.querySelector('.twc-image-viewer')) return;
+    const viewer = el('dialog', 'twc-image-viewer'); viewer.setAttribute('aria-label', `${label}大图`);
+    const toolbar = el('div', 'twc-viewer-toolbar');
+    const controls = el('div', 'twc-viewer-controls');
+    const viewport = el('div', 'twc-viewer-viewport'); viewport.tabIndex = 0;
+    viewport.setAttribute('aria-label', '可滚动的漫画大图');
+    const canvas = el('div', 'twc-viewer-canvas');
+    const image = el('img', ''); image.alt = label; image.draggable = false;
+    const level = el('output', '', '100%');
+    level.setAttribute('aria-label', '缩放比例');
+    let zoom = 100;
+    const less = button('缩小', () => changeZoom(zoom - 25));
+    const more = button('放大', () => changeZoom(zoom + 25));
+    const fit = button('适合窗口', () => changeZoom(100));
+    const close = button('关闭大图', () => viewer.close());
+    close.autofocus = true;
+    function sizeImage() {
+        if (!image.naturalWidth || !viewport.clientWidth || !viewport.clientHeight) return;
+        const scale = Math.min(1, viewport.clientWidth / image.naturalWidth, viewport.clientHeight / image.naturalHeight) * zoom / 100;
+        image.style.width = `${Math.max(1, Math.floor(image.naturalWidth * scale))}px`;
+    }
+    function changeZoom(value) {
+        const centerX = (viewport.scrollLeft + viewport.clientWidth / 2) / viewport.scrollWidth;
+        const centerY = (viewport.scrollTop + viewport.clientHeight / 2) / viewport.scrollHeight;
+        zoom = Math.min(400, Math.max(100, value));
+        level.textContent = `${zoom}%`;
+        less.disabled = zoom === 100; more.disabled = zoom === 400;
+        sizeImage();
+        if (Number.isFinite(centerX) && Number.isFinite(centerY)) {
+            viewport.scrollLeft = zoom === 100 ? 0 : viewport.scrollWidth * centerX - viewport.clientWidth / 2;
+            viewport.scrollTop = zoom === 100 ? 0 : viewport.scrollHeight * centerY - viewport.clientHeight / 2;
+        }
+    }
+    viewport.addEventListener('wheel', event => {
+        if (!event.ctrlKey || !event.deltaY) return;
+        event.preventDefault(); changeZoom(zoom + (event.deltaY < 0 ? 25 : -25));
+    }, { passive: false });
+    image.addEventListener('load', sizeImage);
+    image.src = path;
+    const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(sizeImage) : null;
+    viewer.addEventListener('close', () => { observer?.disconnect(); viewer.remove(); }, { once: true });
+    controls.append(less, level, more, fit);
+    toolbar.append(controls, close);
+    canvas.append(image); viewport.append(canvas); viewer.append(toolbar, viewport); parent.append(viewer);
+    viewer.showModal(); observer?.observe(viewport); changeZoom(100);
 }
 
 function renderMessages() {
@@ -101,17 +163,23 @@ function renderMessages() {
         if (!record) continue;
         const reader = el('details', 'twc-reader'); reader.dataset.revision = key;
         reader.open = Boolean(wasOpen);
-        const completed = record.pages.filter(p => safeImage(p.image) && !p.stale).length;
-        const summary = el('summary', '', running ? `漫画生成中 · ${completed} / ${record.pages.length}` : `漫画 · ${completed} / ${record.pages.length} 页已生成`);
+        const single = record.outputMode === 'single' && Array.isArray(record.singlePages);
+        const pictures = single ? record.singlePages : record.pages;
+        const frames = single ? singleFrames(record.plan) : [];
+        const unit = single ? '格' : '页';
+        const completed = pictures.filter(p => safeImage(p.image) && !p.stale).length;
+        const summary = el('summary', '', running ? `漫画生成中 · ${completed} / ${pictures.length}` : `漫画 · ${completed} / ${pictures.length} ${unit}已生成`);
         if (running) summary.addEventListener('click', event => {
             event.preventDefault();
             openEditor(Number(mes.getAttribute('mesid'))).catch(showError);
         });
         reader.append(summary);
         reader.append(button('查看分镜 / 继续生成', () => openEditor(Number(mes.getAttribute('mesid'))).catch(showError)));
-        for (const [i, page] of record.pages.entries()) if (safeImage(page.image)) {
-            reader.append(el('p', 'twc-caption', `第 ${i + 1} 页 · ${record.plan.pages[i]?.title || ''}${page.stale ? ' · 分镜已修改，下方保留旧图供对照' : ''}`));
-            reader.append(imageNode(page.image, `第 ${i + 1} 页漫画`));
+        for (const [i, page] of pictures.entries()) if (safeImage(page.image)) {
+            const title = single ? frames[i]?.page.title : record.plan.pages[i]?.title;
+            reader.append(el('p', 'twc-caption', `第 ${i + 1} ${unit} · ${title || ''}${page.stale ? ' · 分镜已修改，下方保留旧图供对照' : ''}`));
+            reader.append(imageNode(page.image, `第 ${i + 1} ${unit}漫画`));
+            if (single) appendPanelText(reader, frames[i]?.panel);
         }
         (mes.querySelector('.mes_block') || mes).append(reader);
     }
@@ -388,7 +456,7 @@ async function openEditor(index) {
         syncControls();
     }
     owner.showGeneration = () => {
-        const runningPage = record?.pages.findIndex(page => page.status === 'generating') ?? -1;
+        const runningPage = record ? outputPictures().findIndex(page => page.status === 'generating') : -1;
         if (runningPage >= 0) { selectedOutput = runningPage; renderOutput(); }
         showStage(2);
     };
@@ -419,6 +487,34 @@ async function openEditor(index) {
     const status = el('p', 'twc-status'); status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite'); footer.append(status);
     const warningBox = el('div', 'twc-warnings'); story.append(warningBox);
     const storyEmpty = el('p', 'twc-empty', '先在「准备」中规划分页。'); story.append(storyEmpty);
+    const recovery = el('details', 'twc-disclosure');
+    recovery.append(el('summary', '', '从分镜备份恢复'));
+    const recoveryInput = field(recovery, '选择这条回复的分镜 JSON 备份', '', false);
+    recoveryInput.type = 'file'; recoveryInput.accept = '.json,application/json';
+    const restoreButton = button('恢复分镜', () => withBusy(async () => {
+        ensureFresh();
+        if (record || recordFor(bound)) throw new Error('当前回复已有分镜。');
+        const file = recoveryInput.files?.[0];
+        if (!file || file.size > 4 * 1024 * 1024) throw new Error('请选择不超过 4 MB 的分镜 JSON 备份。');
+        let saved;
+        try { saved = JSON.parse(await file.text()); }
+        catch { throw new Error('无法读取分镜 JSON 备份。'); }
+        ensureFresh();
+        if (halted || recordFor(bound)) throw new Error('当前回复状态已变化，未恢复分镜。');
+        if (saved?.original !== bound.text || saved?.swipe !== bound.swipe) throw new Error('分镜备份与当前回复或分支不匹配。');
+        const plan = validatePlan(saved.plan, segmentSource(saved.source).length);
+        source.value = saved.source;
+        if (typeof saved.appearance === 'string') appearance.value = saved.appearance;
+        if (typeof saved.style === 'string') style.value = saved.style;
+        if (saved.sourceOptions) {
+            useBaiBai.checked = saved.sourceOptions.useBaiBai === true;
+            useWorldbook.checked = saved.sourceOptions.useWorldbook === true;
+        }
+        await saveNewPlan(plan);
+        const count = scenesToReview().size;
+        status.textContent = `已恢复 ${plan.pages.length} 页分镜。${count ? `有 ${count} 页需要核对画面描述。` : '未调用模型。'}`;
+    }));
+    recovery.append(restoreButton); story.append(recovery);
     const planBox = el('div', 'twc-plan'); story.append(planBox);
     const storyGrid = el('div', 'twc-story-grid'); planBox.append(storyGrid);
     const storyRail = el('div', 'twc-story-rail'); const storyPage = el('article', 'twc-story-page twc-surface'); storyGrid.append(storyRail, storyPage);
@@ -432,17 +528,18 @@ async function openEditor(index) {
             status.textContent = '分镜已是最新。';
             return;
         }
-        // 修改分镜后旧图片继续显示，但标记为待重画，避免把旧图视为新分镜结果。
-        record.plan = plan; record.source = source.value; record.appearance = appearance.value; record.style = style.value;
-        record.pages = plan.pages.map((_, i) => ({ image: record.pages[i]?.image, stale: Boolean(record.pages[i]?.image), prompt: buildPagePrompt(plan, i, style.value, appearance.value), status: 'pending' }));
-        record.warnings = [...dialogueWarnings(record.source, plan), ...(record.referenceWarnings ?? []), ...plan.notes.map(note => `人物资料核对：${note}`)];
-        await persist(); renderPlan(); status.textContent = '分镜已保存，旧图保留供对照。点击生成未完成页，会按新分镜重画。';
+        await savePlanEdits(plan);
     }), 'twc-primary'); advanced.append(planSave);
     const outputBar = el('div', 'twc-output-bar'); output.append(outputBar);
+    const formats = el('div', 'twc-output-formats'); formats.setAttribute('role', 'group'); formats.setAttribute('aria-label', '出图方式');
+    const multiFormat = button('分页多格', () => changeOutputMode('multi'));
+    const singleFormat = button('单格·完整', () => changeOutputMode('single'));
+    formats.append(multiFormat, singleFormat); output.append(formats, outputBar);
     const progress = el('p', 'twc-progress'); outputBar.append(progress);
     const pageList = el('div', 'twc-outputs'); output.append(pageList);
     const thumbRail = el('div', 'twc-thumbnails'); const preview = el('div', 'twc-preview'); pageList.append(thumbRail, preview);
     let selectedStory = 0; let selectedOutput = 0;
+    let outputMode = record?.outputMode === 'single' ? 'single' : 'multi';
     const stops = button('停止生成', () => {
         if (generatingImages) {
             stopRequested = true;
@@ -489,10 +586,9 @@ async function openEditor(index) {
         const planningContext = references.reused.length ? { ...references.context, cachedCharacterProfiles: references.reused } : references.context;
         const result = await planWithCurrentConnection(context(), { source: source.value, appearance: appearance.value, style: style.value, responseLength: settings().responseLength, references: planningContext });
         if (!current(bound) || halted) throw new Error('任务已停止或聊天已变化，未写入规划结果。');
-        record = { id: newComicId(), original: bound.text, swipe: bound.swipe, source: source.value, appearance: appearance.value, style: style.value, sourceOptions: sourceOptions(), referenceContext: references.context, referenceReceipt: references.receipt, referenceWarnings: references.warnings, plan: result.plan, warnings: [...references.warnings, ...result.warnings], pages: result.plan.pages.map((_, i) => ({ prompt: buildPagePrompt(result.plan, i, style.value, appearance.value), status: 'pending' })) };
-        selectedStory = 0; selectedOutput = 0;
-        await persist(); renderPlan(); showStage(1);
-        status.textContent = `已规划 ${record.pages.length} 页。请核对分镜和对白。`;
+        await saveNewPlan(result.plan, references, result.warnings);
+        const count = scenesToReview().size;
+        status.textContent = `已规划 ${record.pages.length} 页。${count ? `其中 ${count} 页的画面描述需要修正，可在「分镜」中直接修改。` : '请核对分镜和对白。'}`;
     }), 'twc-primary');
     const generateAll = button('生成未完成页', () => generate(), 'twc-primary');
     const exportButton = button('下载分镜备份', () => { if (record) download(record); });
@@ -504,7 +600,7 @@ async function openEditor(index) {
                 : '酒馆当前空闲，可以规划分页。检查状态未调用模型。';
         } catch (error) { if (!owner.destroyed && runtime === owner) status.textContent = error.message; }
     });
-    controls.push(planButton, generateAll, exportButton, planSave, checkState, readButton, useBaiBai, useWorldbook);
+    controls.push(planButton, generateAll, exportButton, planSave, checkState, readButton, useBaiBai, useWorldbook, multiFormat, singleFormat, recoveryInput, restoreButton);
     sources.append(readButton);
     prepActions.append(el('p', 'twc-help', '规划会使用酒馆当前模型连接。'), planButton);
     options.append(exportButton, checkState);
@@ -517,13 +613,79 @@ async function openEditor(index) {
         record.updated = Date.now();
         await saveRecord(bound, record); renderMessages();
     }
+    async function saveNewPlan(plan, references, warnings = [...dialogueWarnings(source.value, plan), ...plan.notes.map(note => `人物资料核对：${note}`)]) {
+        const referenceWarnings = references?.warnings ?? [];
+        record = { id: newComicId(), original: bound.text, swipe: bound.swipe, source: source.value, appearance: appearance.value, style: style.value, sourceOptions: sourceOptions(), referenceContext: references?.context, referenceReceipt: references?.receipt, referenceWarnings, reviewScenes: true, plan, warnings: [...referenceWarnings, ...warnings], pages: plan.pages.map((_, i) => ({ prompt: buildPagePrompt(plan, i, style.value, appearance.value), status: 'pending' })) };
+        selectedStory = 0; selectedOutput = 0;
+        await persist(); renderPlan(); showStage(1);
+    }
+    function hasUnsavedPlanEdits() {
+        return source.value !== record.source || style.value !== record.style || appearance.value !== record.appearance || planJSON.value !== JSON.stringify(record.plan, null, 2);
+    }
+    function outputPictures() {
+        if (outputMode === 'multi') return record.pages;
+        return record.singlePages ??= singleFrames(record.plan).map(frame => ({ prompt: buildSingleFramePrompt(record.plan, frame, record.style, record.appearance), status: 'pending' }));
+    }
+    function changeOutputMode(mode) {
+        if (!record || mode === outputMode || activeTask) return;
+        outputMode = mode; selectedOutput = 0;
+        renderOutput();
+    }
+    async function savePlanEdits(plan) {
+        const previousPlan = record.plan;
+        const previousStyle = record.style;
+        const previousAppearance = record.appearance;
+        record.plan = plan; record.source = source.value; record.appearance = appearance.value; record.style = style.value;
+        record.pages = plan.pages.map((_, i) => {
+            const previous = record.pages[i];
+            const prompt = buildPagePrompt(plan, i, record.style, record.appearance);
+            if (previous && previousPlan.pages[i] && prompt === buildPagePrompt(previousPlan, i, previousStyle, previousAppearance)) return previous;
+            return { image: previous?.image, stale: Boolean(previous?.image), prompt, status: 'pending' };
+        });
+        if (record.singlePages) {
+            const previousFrames = singleFrames(previousPlan);
+            record.singlePages = singleFrames(plan).map((frame, i) => {
+                const previous = record.singlePages[i];
+                const oldFrame = previousFrames[i];
+                const prompt = buildSingleFramePrompt(plan, frame, record.style, record.appearance);
+                if (previous && oldFrame && prompt === buildSingleFramePrompt(previousPlan, oldFrame, previousStyle, previousAppearance)) return previous;
+                return { image: previous?.image, stale: Boolean(previous?.image), prompt, status: 'pending' };
+            });
+        }
+        record.warnings = [...dialogueWarnings(record.source, plan), ...(record.referenceWarnings ?? []), ...plan.notes.map(note => `人物资料核对：${note}`)];
+        await persist(); renderPlan(); status.textContent = '分镜修改已保存。';
+    }
+    function scenesToReview() {
+        const pages = new Map();
+        if (record?.reviewScenes) {
+            for (const [index, page] of record.plan.pages.entries()) {
+                const panels = page.panels.flatMap((panel, i) => sceneIssues(panel.scene).map(issue => `第 ${i + 1} 格${issue}`));
+                if (panels.length) pages.set(index, panels);
+            }
+        }
+        return pages;
+    }
+    function outputReview() {
+        if (outputMode === 'multi') return scenesToReview();
+        const review = new Map();
+        if (record.reviewScenes) {
+            for (const [index, frame] of singleFrames(record.plan).entries()) {
+                const issues = sceneIssues(frame.panel.scene);
+                if (issues.length) review.set(index, issues);
+            }
+        }
+        return review;
+    }
     function syncControls() {
         const locked = Boolean(activeTask);
         for (const node of [source, appearance, style, planJSON, ...controls]) node.disabled = locked;
         generateAll.disabled = locked || !record;
+        multiFormat.disabled = locked || !record;
+        singleFormat.disabled = locked || !record;
         planSave.disabled = locked || !record;
         exportButton.disabled = locked || !record;
         for (const node of preview.querySelectorAll('button, textarea')) node.disabled = locked;
+        for (const node of storyPage.querySelectorAll('textarea, .twc-save-scene')) node.disabled = locked;
         stops.disabled = !localBusy || halted || stopRequested;
         stops.hidden = !localBusy && output.hidden;
     }
@@ -562,8 +724,9 @@ async function openEditor(index) {
     function renderStoryboard() {
         const { scrollLeft, scrollTop } = storyRail;
         storyRail.replaceChildren(); storyPage.replaceChildren();
+        const review = scenesToReview();
         for (const [i, page] of record.plan.pages.entries()) {
-            const item = button(`${i + 1}. ${page.title}`, () => { selectedStory = i; renderStoryboard(); storyRail.querySelectorAll('button')[i]?.focus(); }, 'twc-story-link');
+            const item = button(`${i + 1}. ${page.title}${review.has(i) ? ' · 待修正' : ''}`, () => { selectedStory = i; renderStoryboard(); syncControls(); storyRail.querySelectorAll('button')[i]?.focus(); }, 'twc-story-link');
             item.setAttribute('aria-pressed', String(selectedStory === i)); storyRail.append(item);
         }
         storyRail.scrollLeft = scrollLeft; storyRail.scrollTop = scrollTop;
@@ -574,55 +737,87 @@ async function openEditor(index) {
         }
         for (const [i, panel] of page.panels.entries()) {
             const card = el('section', 'twc-panel');
-            card.append(el('h4', '', `第 ${i + 1} 格 · ${panel.layout}`), el('p', 'twc-story-text', panel.scene));
-            if (panel.texts.length) {
-                const lines = el('ul', 'twc-dialogue');
-                for (const line of panel.texts) lines.append(el('li', '', `${line.speaker || (line.kind === 'sfx' ? '拟声' : line.kind === 'narration' ? '旁白' : '对白')}　${line.text}`));
-                card.append(lines);
-            }
+            card.append(el('h4', '', `第 ${i + 1} 格 · ${panel.layout}`));
+            const issues = record.reviewScenes ? sceneIssues(panel.scene) : [];
+            if (issues.length) {
+                card.append(el('p', 'twc-warnings', issues.join('。')));
+                const edit = field(card, '修正这一格的画面描述', panel.scene); edit.rows = 4;
+                const pageIndex = selectedStory;
+                card.append(button('保存这一格', () => withBusy(async () => {
+                    ensureFresh();
+                    if (hasUnsavedPlanEdits()) throw new Error('请先保存正文、画风、人物或高级分镜中的修改。');
+                    if (!edit.value.trim()) throw new Error('画面描述不能为空。');
+                    const updated = structuredClone(record.plan);
+                    updated.pages[pageIndex].panels[i].scene = edit.value;
+                    await savePlanEdits(updated);
+                }), 'twc-save-scene'));
+            } else card.append(el('p', 'twc-story-text', panel.scene));
+            appendPanelText(card, panel);
             storyPage.append(card);
         }
     }
     function renderOutput() {
         const { scrollLeft, scrollTop } = thumbRail;
         thumbRail.replaceChildren(); preview.replaceChildren();
+        const single = outputMode === 'single';
+        multiFormat.setAttribute('aria-pressed', String(!single));
+        singleFormat.setAttribute('aria-pressed', String(single));
+        generateAll.textContent = single ? '生成未完成格' : '生成未完成页';
         if (!record) { progress.textContent = '先在「准备」中规划分页。'; return; }
-        const completed = record.pages.filter(page => safeImage(page.image) && !page.stale).length;
-        progress.textContent = `已完成 ${completed} / ${record.pages.length} 页`;
-        for (const [i, page] of record.pages.entries()) {
+        const pictures = outputPictures();
+        const frames = single ? singleFrames(record.plan) : [];
+        const unit = single ? '格' : '页';
+        const review = outputReview();
+        const completed = pictures.filter(page => safeImage(page.image) && !page.stale).length;
+        progress.textContent = `已完成 ${completed} / ${pictures.length} ${unit}${single ? ` · 预计 ${pictures.length} 张` : ''}`;
+        for (const [i, page] of pictures.entries()) {
             const thumb = button('', () => { selectedOutput = i; renderOutput(); thumbRail.querySelectorAll('button')[i]?.focus(); }, 'twc-thumb');
-            const state = page.status === 'generating' ? '生成中' : page.status === 'failed' ? '失败' : page.stale ? '待重画' : page.image ? '已生成' : '待生成';
+            const state = review.has(i) ? '待修正' : page.status === 'generating' ? '生成中' : page.status === 'failed' ? '失败' : page.stale ? '待重画' : page.image ? '已生成' : '待生成';
             thumb.dataset.state = page.status;
             thumb.setAttribute('aria-pressed', String(selectedOutput === i));
             if (safeImage(page.image)) {
                 const image = el('img', ''); image.src = page.image; image.alt = ''; image.loading = 'lazy'; thumb.append(image);
             }
-            thumb.append(el('span', '', `第 ${i + 1} 页`), el('small', '', state)); thumbRail.append(thumb);
+            thumb.append(el('span', '', `第 ${i + 1} ${unit}`), el('small', '', state)); thumbRail.append(thumb);
         }
         thumbRail.scrollLeft = scrollLeft; thumbRail.scrollTop = scrollTop;
-        const i = selectedOutput;
-        const page = record.pages[i];
+        const i = selectedOutput = Math.min(selectedOutput, pictures.length - 1);
+        const page = pictures[i];
+        const hasImage = safeImage(page.image);
+        const imagePath = page.image;
+        const pageLabel = `第 ${i + 1} ${unit}`;
+        const title = single ? frames[i].page.title : record.plan.pages[i].title;
         const actions = el('div', 'twc-preview-heading');
-        actions.append(el('h3', '', `第 ${i + 1} 页 · ${record.plan.pages[i].title}`), button(page.image ? '重画这一页' : '生成这一页', () => generate(i)));
+        const pageActions = el('div', 'twc-preview-actions');
+        if (hasImage) {
+            const link = el('a', 'menu_button twc-button', `下载本${unit}`);
+            link.href = imagePath; link.setAttribute('download', ''); pageActions.append(link);
+        }
+        pageActions.append(button(`${page.image ? '重画' : '生成'}这一${unit}`, () => generate(i)));
+        actions.append(el('h3', '', `${pageLabel} · ${title}`), pageActions);
         preview.append(actions);
+        if (review.has(i)) {
+            const from = single ? `第 ${frames[i].pageIndex + 1} 页第 ${frames[i].panelIndex + 1} 格` : '本页';
+            preview.append(el('p', 'twc-warnings', `请先在「分镜」修正${from}。${review.get(i).join('。')}。`));
+        }
         if (page.status === 'failed') preview.append(el('p', 'twc-warnings', page.error || '请求中断'));
         if (page.stale) preview.append(el('p', 'twc-caption', '分镜已修改，下方保留旧图供对照。'));
-        preview.append(safeImage(page.image) ? imageNode(page.image, `第 ${i + 1} 页`) : el('p', 'twc-empty', page.status === 'generating' ? '正在生成这一页…' : '这一页还没有图片'));
-        const detail = el('details', 'twc-disclosure'); detail.append(el('summary', '', '本页生图提示词'));
+        preview.append(hasImage ? imageNode(imagePath, pageLabel, () => showImageViewer(dialog, imagePath, pageLabel)) : el('p', 'twc-empty', page.status === 'generating' ? `正在生成这一${unit}…` : `这一${unit}还没有图片`));
+        if (single) appendPanelText(preview, frames[i].panel);
+        const detail = el('details', 'twc-disclosure'); detail.append(el('summary', '', `本${unit}生图提示词`));
         const prompt = field(detail, '可修改后保存或重画', page.prompt); prompt.rows = 8;
         prompt.addEventListener('input', () => { page.prompt = prompt.value; });
-        detail.append(button('保存本页提示词', () => withBusy(async () => {
-            ensureFresh(); await persist(); status.textContent = `第 ${i + 1} 页提示词已保存。`;
+        detail.append(button(`保存本${unit}提示词`, () => withBusy(async () => {
+            ensureFresh(); await persist(); status.textContent = `${pageLabel}提示词已保存。`;
         })));
         preview.append(detail);
         syncControls();
     }
     function renderPlan() {
-        planBox.hidden = !record; storyEmpty.hidden = Boolean(record); warningBox.replaceChildren();
+        planBox.hidden = !record; storyEmpty.hidden = Boolean(record); recovery.hidden = Boolean(record); warningBox.replaceChildren();
         planButton.textContent = record ? '重新规划（替换当前分镜）' : '规划分页';
         if (record) {
             selectedStory = Math.min(selectedStory, record.pages.length - 1);
-            selectedOutput = Math.min(selectedOutput, record.pages.length - 1);
             planJSON.value = JSON.stringify(record.plan, null, 2);
             for (const warning of record.warnings ?? []) warningBox.append(el('p', '', warning));
             renderStoryboard();
@@ -633,8 +828,18 @@ async function openEditor(index) {
         await withBusy(async () => {
             ensureFresh();
             if (!record) throw new Error('请先规划分页。');
-            if (source.value !== record.source || style.value !== record.style || appearance.value !== record.appearance || planJSON.value !== JSON.stringify(record.plan, null, 2)) throw new Error('正文、画风、人物或分镜有未保存的修改。请重新规划或保存分镜修改，再出图。');
-            if (record.pages.some(p => !p.prompt?.trim())) throw new Error('生图提示词不能为空。');
+            if (hasUnsavedPlanEdits()) throw new Error('正文、画风、人物或分镜有未保存的修改。请重新规划或保存分镜修改，再出图。');
+            const pictures = outputPictures();
+            const unit = outputMode === 'single' ? '格' : '页';
+            const review = outputReview();
+            const pending = pictures.map((page, i) => ({ page, i })).filter(({ page, i }) => forceIndex === null ? !page.image || page.stale : i === forceIndex);
+            const ready = pending.filter(({ i }) => !review.has(i));
+            const blocked = pending.length - ready.length;
+            if (!ready.length) {
+                status.textContent = blocked ? '待生成的页面需要先在「分镜」中修正画面描述。' : '所有页面均已生成。';
+                return;
+            }
+            if (ready.some(({ page }) => !page.prompt?.trim())) throw new Error('生图提示词不能为空。');
             showStage(2);
             const { drawingBackend: backend, comfyUrl, webuiUrl, novelModel, workflow: savedWorkflow, workflowBindings, useLegacyWorkflow } = settings();
             if (backend === 'off') throw new Error('绘图后端已关闭。请先在「准备 → 绘图后端」选择并保存设置。');
@@ -645,23 +850,25 @@ async function openEditor(index) {
             } else if (backend === 'webui') {
                 address = normalizeComfyUrl(webuiUrl, 'SD WebUI');
             }
-            await runPages(record.pages, async (page, i) => {
+            record.outputMode = outputMode;
+            await runPages(pictures, async (page, i) => {
                 const seed = crypto.getRandomValues(new Uint32Array(1))[0]; page.seed = seed;
-                const filename = `comic-${record.id}-${i + 1}-${Date.now()}`;
+                const filename = `comic-${record.id}-${outputMode === 'single' ? 'single-' : ''}${i + 1}-${Date.now()}`;
                 const graph = workflow && fillWorkflow(workflow, { prompt: page.prompt, seed, filename_prefix: `tw-comic/${filename}` });
                 return generateImage(context(), { backend, url: address, graph, prompt: page.prompt, seed, model: novelModel, filename });
             }, () => !halted && !owner.destroyed && runtime === owner && current(bound), {
-                forceIndex, shouldStop: () => stopRequested, onUpdate: async (_, i) => {
+                forceIndex, skipPage: i => review.has(i), shouldStop: () => stopRequested, onUpdate: async (_, i) => {
                     ensureFresh(); await persist();
                     if (!dialog.open) selectedOutput = i;
                     renderOutput();
-                    if (!stopRequested) status.textContent = record.pages[i].status === 'generating' ? `正在生成第 ${i + 1} / ${record.pages.length} 页，请等待。` : `第 ${i + 1} 页状态已保存。`;
+                    if (!stopRequested) status.textContent = pictures[i].status === 'generating' ? `正在生成第 ${i + 1} / ${pictures.length} ${unit}，请等待。` : `第 ${i + 1} ${unit}状态已保存。`;
                 },
             });
-            status.textContent = stopRequested ? '已停止生成，完成的图片已保存到对应消息。' : '本次图片生成完成，已保存到对应消息。请核对图片中的文字和情节。';
+            status.textContent = stopRequested ? '已停止生成，完成的图片已保存到对应消息。' : blocked ? `可出图的图片已生成并保存。还有 ${blocked} ${unit}需要在「分镜」中修正。` : '本次图片生成完成，已保存到对应消息。请核对图片中的文字和情节。';
         }, { images: true });
     }
     function disposeDialog() {
+        dialog.querySelector('.twc-image-viewer')?.close();
         owner.nodes.delete(dialog); dialog.remove();
         if (owner.dialog === dialog) { owner.dialog = null; owner.dialogBound = null; owner.showGeneration = null; }
         if (owner.refreshControls === syncControls) owner.refreshControls = null;
@@ -675,7 +882,7 @@ async function openEditor(index) {
     document.body.append(dialog);
     if (record?.referenceContext) showPeople(observedProfiles(record.referenceContext));
     renderPlan();
-    showStage(record?.pages.some(page => page.image) ? 2 : record ? 1 : 0);
+    showStage(record && ([...record.pages, ...(record.singlePages ?? [])].some(page => page.image)) ? 2 : record ? 1 : 0);
     dialog.showModal();
 }
 
@@ -696,7 +903,8 @@ function init() {
 }
 export function onDisable() {
     if (!runtime || runtime.destroyed) return;
-    runtime.destroyed = true; runtime.dialog?.close();
+    runtime.destroyed = true;
+    runtime.dialog?.querySelector('.twc-image-viewer')?.close(); runtime.dialog?.close();
     for (const [source, name, fn] of runtime.subscriptions) source.removeListener(name, fn);
     for (const node of runtime.nodes) node.remove();
     for (const node of document.querySelectorAll('.twc-message-button, .twc-reader')) node.remove();
