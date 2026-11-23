@@ -1,5 +1,5 @@
 import { segmentSource, validatePlan, sceneIssues, shortSceneBatch, dialogueWarnings, DIALOGUE_WARNING_PREFIX, buildPagePrompt, buildSingleFramePrompt, singleFrames, DEFAULT_STORYBOARD_RULES, DEFAULT_IMAGE_TEMPLATES, validateImageTemplate, fillWorkflow, workflowNodes, prepareComfyWorkflow, COMFY_WORKFLOW_FIELDS, bindingMatches, runPages } from './core.mjs';
-import { checkHost, planWithCurrentConnection, detailScenesWithCurrentConnection, generateImage, normalizeComfyUrl, testComfyConnection, testNovelConnection, testWebUiConnection, readHostGenerationState, saveNovelKey } from './services.mjs';
+import { checkHost, planWithCurrentConnection, detailScenesWithCurrentConnection, generateImage, normalizeComfyUrl, testComfyConnection, testNovelConnection, testWebUiConnection, readHostGenerationState, saveNovelKey, describeHistoryChat, listHistoryChats, readHistoryChat, HISTORY_CHAT_LIMIT } from './services.mjs';
 import { collectReferences } from './references.mjs';
 import { cleanCharacterProfiles, observedProfiles, reuseCharacterProfiles } from './character-cache.mjs';
 import { DEFAULT_PREFERENCES, LEGACY_STYLE, upgradePreferences } from './preferences.mjs';
@@ -63,10 +63,52 @@ async function saveRecord(bound, record) {
     const store = bound.message.extra[ID] ??= { version: 1, variants: [] };
     if (!Array.isArray(store.variants)) throw new Error('漫画记录格式不兼容，请先导出备份。');
     const at = store.variants.findIndex(r => r.original === bound.text && r.swipe === bound.swipe);
-    if (at < 0) store.variants.push(record); else store.variants[at] = record;
+    if (at < 0) store.variants.push(record);
+    else {
+        const previous = store.variants[at];
+        if (previous !== record) archiveImages(store, recordImages(previous));
+        store.variants[at] = record;
+    }
     await context().saveChat();
 }
 function safeImage(path) { return typeof path === 'string' && path.startsWith('/') && !path.startsWith('//') && !/[\u0000-\u0020\\]/u.test(path); }
+function recordImages(record) {
+    const planPages = Array.isArray(record?.plan?.pages) ? record.plan.pages : [];
+    const frameTitles = planPages.flatMap(page => Array.isArray(page?.panels) ? page.panels.map(() => page.title) : []);
+    return [[record?.pages, '页', planPages.map(page => page?.title)], [record?.singlePages, '格', frameTitles]]
+        .flatMap(([pages, unit, titles]) => Array.isArray(pages) ? pages.flatMap((page, index) => {
+            if (!safeImage(page?.image)) return [];
+            const title = typeof titles[index] === 'string' ? ` · ${titles[index]}` : '';
+            return [{ image: page.image, label: `第 ${index + 1} ${unit}${title}` }];
+        }) : []);
+}
+function archiveImages(store, images) {
+    if (!images.length) return;
+    const archive = Array.isArray(store.archive) ? store.archive : (store.archive = []);
+    const known = new Set(archive.map(item => item?.image));
+    for (const item of images) if (!known.has(item.image)) {
+        archive.push(item);
+        known.add(item.image);
+    }
+}
+function extractHistory(messages) {
+    const seen = new Set();
+    let number = 0;
+    return messages.flatMap(message => {
+        if (typeof message?.mes !== 'string') return [];
+        number++;
+        const stores = [message.extra?.[ID], ...(Array.isArray(message.swipe_info) ? message.swipe_info.map(swipe => swipe?.extra?.[ID]) : [])];
+        return stores.flatMap(store => {
+            const images = Array.isArray(store?.variants) ? store.variants.flatMap(recordImages) : [];
+            if (Array.isArray(store?.archive)) images.push(...store.archive);
+            return images.flatMap(item => {
+                if (!safeImage(item?.image) || seen.has(item.image)) return [];
+                seen.add(item.image);
+                return [{ image: item.image, label: typeof item.label === 'string' ? item.label : '漫画图片', number }];
+            });
+        });
+    });
+}
 function download(record) {
     const url = URL.createObjectURL(new Blob([JSON.stringify(record, null, 2)], { type: 'application/json' }));
     const link = el('a'); link.href = url; link.download = `comic-${record.id}.json`; link.click();
@@ -139,6 +181,129 @@ function showImageViewer(parent, path, label) {
     toolbar.append(controls, close);
     canvas.append(image); viewport.append(canvas); viewer.append(toolbar, viewport); parent.append(viewer);
     viewer.showModal(); observer?.observe(viewport); changeZoom(100);
+}
+
+function mountOutputHistory(output, dialog) {
+    const views = el('div', 'twc-output-formats');
+    views.setAttribute('role', 'group');
+    views.setAttribute('aria-label', '出图视图');
+    const currentButton = button('本次出图', () => show(false));
+    const historyButton = button('历史出图', () => { if (history.hidden) show(true); });
+    views.append(currentButton, historyButton);
+    const currentOutput = el('div');
+    const history = el('section', 'twc-history');
+    const toolbar = el('div', 'twc-history-toolbar');
+    const pickerLabel = el('label', 'twc-field');
+    const picker = el('select', 'text_pole');
+    pickerLabel.append(el('span', '', '聊天'), picker);
+    toolbar.append(pickerLabel, button('刷新历史', load));
+    const status = el('p', 'twc-help twc-history-status');
+    status.setAttribute('role', 'status');
+    const gallery = el('div', 'twc-history-gallery');
+    history.append(toolbar, status, gallery);
+    output.append(views, currentOutput, history);
+    let scan;
+    let albums = new Map();
+
+    function stop() { scan?.abort(); }
+    function show(historical) {
+        currentOutput.hidden = historical;
+        history.hidden = !historical;
+        currentButton.setAttribute('aria-pressed', String(!historical));
+        historyButton.setAttribute('aria-pressed', String(historical));
+        if (historical) void load();
+        else stop();
+    }
+    function renderGallery() {
+        gallery.replaceChildren();
+        const album = albums.get(picker.value);
+        if (!album) return;
+        const groups = new Map();
+        for (const { image, label, number } of album.images) {
+            if (!groups.has(number)) {
+                const group = el('section', 'twc-surface twc-history-group');
+                const grid = el('div', 'twc-history-grid');
+                group.append(el('h3', '', `第 ${number} 条消息`), grid);
+                gallery.append(group); groups.set(number, grid);
+            }
+            const card = el('div', 'twc-history-card');
+            const picture = imageNode(image, label, () => showImageViewer(dialog, image, label));
+            const fallback = el('p', 'twc-help', '图片文件无法加载。'); fallback.hidden = true;
+            picture.querySelector('img').addEventListener('error', () => { picture.hidden = true; fallback.hidden = false; });
+            const downloadLink = el('a', 'menu_button twc-button', '下载');
+            downloadLink.href = image; downloadLink.setAttribute('download', '');
+            card.append(picture, fallback, el('span', '', label), downloadLink);
+            groups.get(number).append(card);
+        }
+    }
+    picker.addEventListener('change', renderGallery);
+
+    function updatePicker(changedKey) {
+        const selected = picker.value;
+        const ordered = [...albums.values()].sort((a, b) => a.order - b.order);
+        picker.replaceChildren(...ordered.map(album => {
+            const option = el('option', '', `${album.name}（${album.images.length} 张）`);
+            option.value = album.key;
+            return option;
+        }));
+        picker.disabled = !ordered.length;
+        picker.value = albums.has(selected) ? selected : ordered[0]?.key ?? '';
+        if (selected !== picker.value || changedKey === picker.value) renderGallery();
+    }
+    async function load() {
+        stop();
+        const controller = scan = new AbortController();
+        const { signal } = controller;
+        const ctx = context();
+        const live = describeHistoryChat({ file_name: ctx.chatId, group: ctx.groupId, avatar: ctx.characters?.[ctx.characterId]?.avatar }, ctx)
+            ?? { key: 'current', name: `${ctx.chatId ?? '聊天'}` };
+        const liveImages = extractHistory(ctx.chat ?? []);
+        let checked = 0;
+        let failed = 0;
+        albums = new Map();
+        if (liveImages.length) albums.set(live.key, { ...live, name: `${live.name}（当前聊天）`, images: liveImages, order: -1 });
+        updatePicker(live.key);
+        status.textContent = '正在查找聊天里的历史图片…';
+        try {
+            const { chats, limited } = await listHistoryChats(ctx, signal);
+            if (signal.aborted) return;
+            let next = 0;
+            async function scanChats() {
+                while (!signal.aborted && next < chats.length) {
+                    const index = next++;
+                    const chat = chats[index];
+                    try {
+                        const messages = await readHistoryChat(ctx, chat, signal);
+                        if (signal.aborted) return;
+                        const images = extractHistory(messages);
+                        const isCurrent = chat.key === live.key;
+                        if (isCurrent) {
+                            const savedPaths = new Set(images.map(item => item.image));
+                            images.push(...liveImages.filter(item => !savedPaths.has(item.image)));
+                        }
+                        if (images.length) {
+                            albums.set(chat.key, { ...chat, name: isCurrent ? `${chat.name}（当前聊天）` : chat.name, images, order: isCurrent ? -1 : index });
+                            updatePicker(chat.key);
+                        }
+                    } catch {
+                        if (signal.aborted) return;
+                        failed++;
+                    }
+                    checked++;
+                    status.textContent = `已检查 ${checked} / ${chats.length} 个聊天，找到 ${albums.size} 个有出图的聊天。`;
+                }
+            }
+            await Promise.all(Array.from({ length: Math.min(4, chats.length) }, scanChats));
+            if (signal.aborted) return;
+            status.textContent = (albums.size ? `找到 ${albums.size} 个聊天的历史出图。` : '没有找到可查看的历史出图。')
+                + (failed ? `有 ${failed} 个聊天读取失败，可刷新重试。` : '')
+                + (limited ? `已检查最近 ${HISTORY_CHAT_LIMIT} 个聊天。` : '');
+        } catch {
+            if (!signal.aborted) status.textContent = '无法读取聊天列表。可查看当前聊天已载入的图片，或刷新重试。';
+        }
+    }
+    show(false);
+    return { currentOutput, stop, showCurrent: () => show(false) };
 }
 
 function renderMessages() {
@@ -454,6 +619,7 @@ async function openEditor(index) {
         syncControls();
     }
     owner.showGeneration = () => {
+        outputHistory.showCurrent();
         const runningPage = record ? outputPictures().findIndex(page => page.status === 'generating') : -1;
         if (runningPage >= 0) { selectedOutput = runningPage; renderOutput(); }
         showStage(2);
@@ -589,13 +755,15 @@ async function openEditor(index) {
         }
         await savePlanEdits(plan);
     }), 'twc-primary'); advanced.append(planSave);
-    const outputBar = el('div', 'twc-output-bar'); output.append(outputBar);
+    const outputHistory = mountOutputHistory(output, dialog);
+    const { currentOutput } = outputHistory;
+    const outputBar = el('div', 'twc-output-bar');
     const formats = el('div', 'twc-output-formats'); formats.setAttribute('role', 'group'); formats.setAttribute('aria-label', '出图方式');
     const multiFormat = button('分页多格', () => changeOutputMode('multi'));
     const singleFormat = button('单格·完整', () => changeOutputMode('single'));
-    formats.append(multiFormat, singleFormat); output.append(formats, outputBar);
+    formats.append(multiFormat, singleFormat); currentOutput.append(formats, outputBar);
     const progress = el('p', 'twc-progress'); outputBar.append(progress);
-    const pageList = el('div', 'twc-outputs'); output.append(pageList);
+    const pageList = el('div', 'twc-outputs'); currentOutput.append(pageList);
     const thumbRail = el('div', 'twc-thumbnails'); const preview = el('div', 'twc-preview'); pageList.append(thumbRail, preview);
     let selectedStory = 0; let selectedOutput = 0;
     let outputMode = record?.outputMode === 'single' ? 'single' : 'multi';
@@ -693,6 +861,7 @@ async function openEditor(index) {
         renderOutput();
     }
     async function savePlanEdits(plan, templates = record.promptTemplates) {
+        const previousImages = recordImages(record);
         const previousPlan = record.plan;
         const previousStyle = record.style;
         const previousAppearance = record.appearance;
@@ -715,6 +884,8 @@ async function openEditor(index) {
                 return { image: previous?.image, stale: Boolean(previous?.image), prompt, status: 'pending' };
             });
         }
+        const retained = new Set(recordImages(record).map(item => item.image));
+        archiveImages(bound.message.extra[ID], previousImages.filter(item => !retained.has(item.image)));
         record.warnings = [...dialogueWarnings(record.source, plan), ...(record.referenceWarnings ?? []), ...plan.notes.map(note => `人物资料核对：${note}`)];
         await persist(); renderPlan(); status.textContent = '分镜修改已保存。';
     }
@@ -919,14 +1090,19 @@ async function openEditor(index) {
                 address = normalizeComfyUrl(webuiUrl, 'SD WebUI');
             }
             record.outputMode = outputMode;
+            const previousImages = new Map(recordImages(record).map(item => [item.image, item]));
+            const previousPaths = pictures.map(page => page.image);
             await runPages(pictures, async (page, i) => {
                 const seed = crypto.getRandomValues(new Uint32Array(1))[0]; page.seed = seed;
                 const filename = `comic-${record.id}-${outputMode === 'single' ? 'single-' : ''}${i + 1}-${Date.now()}`;
                 const graph = workflow && fillWorkflow(workflow, { prompt: page.prompt, seed, filename_prefix: `tw-comic/${filename}` });
                 return generateImage(context(), { backend, url: address, graph, prompt: page.prompt, seed, model: novelModel, filename });
             }, () => !halted && !owner.destroyed && runtime === owner && current(bound), {
-                forceIndex, skipPage: i => review.has(i), shouldStop: () => stopRequested, onUpdate: async (_, i) => {
-                    ensureFresh(); await persist();
+                forceIndex, skipPage: i => review.has(i), shouldStop: () => stopRequested, onUpdate: async (page, i) => {
+                    ensureFresh();
+                    const previous = previousImages.get(previousPaths[i]);
+                    if (previous && page.status === 'done' && page.image !== previous.image) archiveImages(bound.message.extra[ID], [previous]);
+                    await persist();
                     if (!dialog.open) selectedOutput = i;
                     renderOutput();
                     if (!stopRequested) status.textContent = pictures[i].status === 'generating' ? `正在生成第 ${i + 1} / ${pictures.length} ${unit}，请等待。` : `第 ${i + 1} ${unit}状态已保存。`;
@@ -936,13 +1112,16 @@ async function openEditor(index) {
         }, { images: true });
     }
     function disposeDialog() {
+        outputHistory.stop();
         dialog.querySelector('.twc-image-viewer')?.close();
         owner.nodes.delete(dialog); dialog.remove();
         if (owner.dialog === dialog) { owner.dialog = null; owner.dialogBound = null; owner.showGeneration = null; }
         if (owner.refreshControls === syncControls) owner.refreshControls = null;
     }
     dialog.addEventListener('close', () => {
-        if (dialog.open || generatingImages) return;
+        if (dialog.open) return;
+        outputHistory.showCurrent();
+        if (generatingImages) return;
         halted = true;
         disposeDialog();
     });

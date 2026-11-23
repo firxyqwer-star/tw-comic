@@ -66,6 +66,43 @@ async function post(ctx, path, body, request, signal) {
     return request(path, { method: 'POST', headers: ctx.getRequestHeaders(), body: JSON.stringify(body), signal });
 }
 
+export const HISTORY_CHAT_LIMIT = 1000;
+const chatFileId = name => typeof name === 'string' ? name.replace(/\.jsonl$/iu, '') : '';
+
+export function describeHistoryChat({ file_name, avatar, group }, ctx) {
+    const id = chatFileId(file_name);
+    if (!id || (!avatar && !group)) return null;
+    const owner = group
+        ? ctx.groups?.find(item => String(item.id) === String(group))?.name ?? '群聊'
+        : ctx.characters?.find(item => item?.avatar === avatar)?.name ?? avatar.replace(/\.png$/iu, '');
+    return { id, avatar, group, key: JSON.stringify([group ? 'group' : 'character', group ? String(group) : avatar, id]), name: owner === id ? id : `${owner} / ${id}` };
+}
+
+async function readHistoryData(ctx, path, body, signal) {
+    const response = await post(ctx, path, body, globalThis.fetch, AbortSignal.any([signal, AbortSignal.timeout(30000)]));
+    if (!response.ok) throw new Error('无法读取酒馆聊天记录。');
+    const data = await response.json();
+    if (!Array.isArray(data)) throw new Error('酒馆返回的聊天记录格式无法读取。');
+    return data;
+}
+
+export async function listHistoryChats(ctx, signal) {
+    const data = await readHistoryData(ctx, '/api/chats/recent', { max: HISTORY_CHAT_LIMIT }, signal);
+    const chats = new Map();
+    for (const entry of data) {
+        if (!entry || (typeof entry.avatar !== 'string' && !entry.group)) continue;
+        const chat = describeHistoryChat(entry, ctx);
+        if (chat) chats.set(chat.key, chat);
+    }
+    return { chats: [...chats.values()], limited: data.length >= HISTORY_CHAT_LIMIT };
+}
+
+export async function readHistoryChat(ctx, chat, signal) {
+    return chat.group
+        ? readHistoryData(ctx, '/api/chats/group/get', { id: chat.id }, signal)
+        : readHistoryData(ctx, '/api/chats/get', { file_name: chat.id, avatar_url: chat.avatar }, signal);
+}
+
 export function normalizeComfyUrl(url, provider = 'ComfyUI') {
     try {
         const address = new URL(url);
