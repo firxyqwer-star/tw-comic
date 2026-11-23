@@ -69,6 +69,7 @@
 .twc-person { padding:3px 8px;border-radius:6px;background:#eeebf7;color:#4e3f8a;font-size:.86em; }
 .twc-actions,.twc-output-bar,.twc-preview-heading { display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:9px;margin:14px 0; }
 .twc-actions .twc-help,.twc-preview-heading h3 { margin:0; }
+.twc-plan-controls { display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:8px;margin-inline-start:auto; }
 .twc-output-bar { margin:0 0 13px; }
 .twc-output-formats { display:flex;flex-wrap:wrap;gap:6px;margin:0 0 12px; }
 .twc-dialog .twc-output-formats button[aria-pressed="true"] { border-color:#8574c4;background:#e9e1fa;color:#422f84;font-weight:700; }
@@ -118,6 +119,8 @@
 .twc-image { display:block;max-width:100%;width:auto;height:auto;margin:10px auto;border-radius:5px;background:#fff; }
 .twc-preview .twc-image { max-height:min(660px,78dvh); }
 .twc-reader .twc-image { max-height:1100px; }
+.twc-inline-comic { display:block;margin:10px 0; }
+.twc-inline-comic .twc-image { max-height:1100px; }
 .twc-image-link { display:block; }
 .twc-preview .twc-image-link { width:fit-content;max-width:100%;margin-inline:auto;cursor:zoom-in; }
 .twc-image-viewer {

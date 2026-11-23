@@ -1,17 +1,8 @@
 {
   "name": "tw-comic",
-  "version": "0.2.15",
+  "version": "0.3.02",
   "private": true,
   "type": "module",
-  "files": [
-    "manifest.json",
-    "index.js",
-    "style.css",
-    "core.mjs",
-    "services.mjs",
-    "references.mjs",
-    "preferences.mjs",
-    "character-cache.mjs",
-    "workflows/moss-25-api.json"
-  ]
+  "files": ["manifest.json", "index.js", "style.css", "core.mjs", "services.mjs", "references.mjs", "preferences.mjs", "character-cache.mjs"],
+  "scripts": { "test": "node --test" }
 }

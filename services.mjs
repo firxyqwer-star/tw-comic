@@ -50,10 +50,10 @@ async function runPlanningRequest(ctx, request) {
     return raw;
 }
 
-export async function planWithCurrentConnection(ctx, { source, appearance = '', style = '', responseLength = 12000, references = null, storyboardRules = '' }) {
+export async function planWithCurrentConnection(ctx, { source, appearance = '', style = '', responseLength = 12000, references = null, storyboardRules = '', mode = 'multi' }) {
     const segments = segmentSource(source);
-    const raw = await runPlanningRequest(ctx, plannerRequest(segments, appearance, style, responseLength, references, storyboardRules));
-    const plan = validatePlan(raw, segments.length);
+    const raw = await runPlanningRequest(ctx, plannerRequest(segments, appearance, style, responseLength, references, storyboardRules, mode));
+    const plan = validatePlan(raw, segments.length, mode);
     return { plan, warnings: [...dialogueWarnings(source, plan), ...plan.notes.map(note => `人物资料核对：${note}`)], segments };
 }
 
