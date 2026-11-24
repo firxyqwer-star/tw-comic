@@ -3,7 +3,6 @@ import { resolveReferenceCard } from './references.mjs';
 export const CHARACTER_CACHE_FIELD = 'tw_comic_character_cache_v1';
 const MAX_PROFILES = 24;
 const MAX_REUSED = 8;
-const sources = { baiBai: 'useBaiBai', worldbook: 'useWorldbook' };
 let pendingWrite;
 
 const cleanText = (value, limit) => typeof value === 'string' ? value.trim().slice(0, limit) : '';
@@ -35,40 +34,47 @@ function worldProfile(entry) {
 }
 
 export function observedProfiles(context) {
-    const profiles = new Map();
-    for (const person of [...(context.baiBai?.after.npcs ?? []), ...(context.baiBai?.before.npcs ?? [])]) {
-        const name = cleanText(person.name, 100);
-        const description = cleanText(person.desc, 950);
-        if (name && description) profiles.set(nameKey(name), { source: 'baiBai', name, description });
-    }
-    return [...profiles.values(), ...(context.worldbooks ?? []).map(worldProfile).filter(Boolean)];
+    const entries = (context.worldbooks ?? []).map(worldProfile).filter(Boolean);
+    const extracted = context.extractedProfiles ?? [];
+    const keys = new Set(extracted.map(profileKey));
+    return [...extracted, ...entries.filter(profile => !keys.has(profileKey(profile)))];
 }
 
 function profileKey(profile) {
-    return profile.source === 'worldbook'
-        ? JSON.stringify([profile.source, profile.book, profile.uid ?? profile.title])
-        : JSON.stringify([profile.source, nameKey(profile.name)]);
+    return JSON.stringify([profile.book, profile.uid ?? profile.title, nameKey(profile.name)]);
 }
 
 function storedProfiles(card) {
     const value = card?.data?.extensions?.[CHARACTER_CACHE_FIELD];
     if (!Array.isArray(value)) return [];
-    return value.slice(0, MAX_PROFILES).filter(profile => profile && Object.hasOwn(sources, profile.source)
+    return value.slice(0, MAX_PROFILES).filter(profile => profile?.source === 'worldbook'
         && typeof profile.name === 'string' && profile.name.length > 0 && profile.name.length <= 100
-        && typeof profile.description === 'string' && profile.description.length > 0 && profile.description.length <= 950
-        && (profile.source === 'baiBai' || (typeof profile.book === 'string' && typeof profile.title === 'string')));
+        && typeof profile.description === 'string' && profile.description.length <= 950
+        && (profile.outfit == null || (typeof profile.outfit === 'string' && profile.outfit.length <= 950))
+        && (profile.description || profile.outfit)
+        && typeof profile.book === 'string' && typeof profile.title === 'string');
 }
 
 export async function reuseCharacterProfiles(ctx, options, references) {
+    if (!options.useWorldbook) return { reused: [], saved: 0 };
     const card = resolveReferenceCard(ctx, options.floor);
     const existing = storedProfiles(card);
-    const live = observedProfiles(references.context);
+    const existingByKey = new Map(existing.map(profile => [profileKey(profile), profile]));
+    const live = observedProfiles(references.context).map(profile => {
+        if (profile.outfit !== undefined) return profile;
+        const saved = existingByKey.get(profileKey(profile));
+        if (!saved?.outfit) return profile;
+        const entry = references.context.worldbooks.find(item => item.book === profile.book
+            && (item.uid ?? item.title) === (profile.uid ?? profile.title));
+        if (!entry || !saved.outfit.split('；').every(part => entry.content.includes(part))) return profile;
+        return { ...profile, outfit: saved.outfit };
+    });
     const liveKeys = new Set(live.map(profileKey));
-    const liveByName = new Map(live.map(profile => [JSON.stringify([profile.source, nameKey(profile.name)]), profile]));
-    const reused = existing.filter(profile => options[sources[profile.source]]
-        && references.matchText.includes(nameKey(profile.name))).filter(profile => {
-        const current = liveByName.get(JSON.stringify([profile.source, nameKey(profile.name)]));
-        return !current || (profileKey(current) === profileKey(profile) && current.description === profile.description);
+    const liveByName = new Map(live.map(profile => [nameKey(profile.name), profile]));
+    const reused = existing.filter(profile => references.matchText.includes(nameKey(profile.name))).filter(profile => {
+        const current = liveByName.get(nameKey(profile.name));
+        return !current || (profileKey(current) === profileKey(profile) && current.description === profile.description
+            && (current.outfit ?? '') === (profile.outfit ?? ''));
     }).slice(0, MAX_REUSED);
     const result = { reused, saved: 0 };
 

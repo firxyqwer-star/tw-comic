@@ -1,5 +1,5 @@
-import { segmentSource, validatePlan, sceneIssues, shortSceneBatch, dialogueWarnings, DIALOGUE_WARNING_PREFIX, buildPagePrompt, buildSingleFramePrompt, singleFrames, DEFAULT_STORYBOARD_RULES, DEFAULT_SINGLE_STORYBOARD_RULES, DEFAULT_IMAGE_TEMPLATES, validateImageTemplate, fillWorkflow, workflowNodes, prepareComfyWorkflow, COMFY_WORKFLOW_FIELDS, bindingMatches, runPages } from './core.mjs';
-import { checkHost, planWithCurrentConnection, detailScenesWithCurrentConnection, generateImage, normalizeComfyUrl, testComfyConnection, testNovelConnection, testWebUiConnection, readHostGenerationState, saveNovelKey, describeHistoryChat, listHistoryChats, readHistoryChat, HISTORY_CHAT_LIMIT } from './services.mjs';
+import { cleanStoryboardSource, segmentSource, validatePlan, sceneIssues, shortSceneBatch, dialogueWarnings, DIALOGUE_WARNING_PREFIX, buildPagePrompt, buildSingleFramePrompt, singleFrames, DEFAULT_STORYBOARD_RULES, DEFAULT_SINGLE_STORYBOARD_RULES, DEFAULT_IMAGE_TEMPLATES, validateImageTemplate, fillWorkflow, workflowNodes, prepareComfyWorkflow, COMFY_WORKFLOW_FIELDS, bindingMatches, runPages } from './core.mjs';
+import { checkHost, planWithCurrentConnection, detailScenesWithCurrentConnection, extractWorldbookProfiles, generateImage, normalizeComfyUrl, testComfyConnection, testNovelConnection, testWebUiConnection, readHostGenerationState, saveNovelKey, describeHistoryChat, listHistoryChats, readHistoryChat, HISTORY_CHAT_LIMIT } from './services.mjs';
 import { collectReferences } from './references.mjs';
 import { cleanCharacterProfiles, observedProfiles, reuseCharacterProfiles } from './character-cache.mjs';
 import { DEFAULT_PREFERENCES, LEGACY_STYLE, upgradePreferences } from './preferences.mjs';
@@ -663,7 +663,6 @@ function mountSettings() {
     const config = settings();
     box.append(el('h4', '', '分镜与人物资料'));
     box.append(el('p', 'twc-help', '分镜规划使用酒馆当前连接。点击规划才调用模型。'));
-    const useBaiBai = toggle(box, '读取柏宝书资料（只读）', config.useBaiBai);
     const useWorldbook = toggle(box, '读取世界书资料（只读）', config.useWorldbook);
     box.append(el('p', 'twc-help', '两个开关互相独立，作为新规划的默认值。世界书读取当前角色、群组角色、聊天与全局绑定书的匹配条目；不会执行原生触发器或宏。'));
     box.append(el('p', 'twc-help', '分镜提示词、出图模板和输出上限可在工作台的「规则」页调整。'));
@@ -672,7 +671,7 @@ function mountSettings() {
     const result = el('p', 'twc-status'); result.setAttribute('role', 'status');
     box.append(button('保存设置', () => {
         try {
-            Object.assign(config, { style: style.value, appearance: appearance.value, useBaiBai: useBaiBai.checked, useWorldbook: useWorldbook.checked });
+            Object.assign(config, { style: style.value, appearance: appearance.value, useWorldbook: useWorldbook.checked });
             context().saveSettingsDebounced(); result.textContent = '设置已保存。';
         } catch (error) { result.textContent = error.message; }
     }), result);
@@ -727,8 +726,9 @@ async function openEditor(index) {
     const copy = el('section', 'twc-surface'); prepBody.append(copy);
     const sources = el('section', 'twc-surface'); prepBody.append(sources);
     sources.append(el('h3', '', '人物资料'));
-    const source = field(copy, '待改编正文', record?.source ?? bound.text); source.rows = 12;
-    copy.append(el('p', 'twc-help', '这里的修改只用于漫画。状态栏或脚本可以从待改编正文中删掉。'));
+    const cleanOriginal = cleanStoryboardSource(bound.text);
+    const source = field(copy, '待改编正文', record?.source ?? cleanOriginal); source.rows = 12;
+    copy.append(el('p', 'twc-help', '这里的修改只用于漫画。规划时会自动清理已识别的推理标签和状态占位符。'));
     const appearance = field(copy, '人物外观与当前状态', record?.appearance ?? config.appearance); appearance.rows = 3;
     const inlineImages = toggle(copy, '在对应正文后插入漫画图片', config.inlineImages);
     inlineImages.className = 'twc-inline-toggle';
@@ -737,16 +737,14 @@ async function openEditor(index) {
         context().saveSettingsDebounced();
         renderMessages();
     });
-    const useBaiBai = toggle(sources, '读取柏宝书资料（本次，只读）', record?.sourceOptions?.useBaiBai ?? config.useBaiBai);
     const useWorldbook = toggle(sources, '读取世界书资料（本次，只读）', record?.sourceOptions?.useWorldbook ?? config.useWorldbook);
-    sources.append(el('p', 'twc-help', '人物外观按角色卡缓存。关闭来源时也跳过它的缓存。'));
-    const people = el('div', 'twc-people'); sources.append(people);
+    sources.append(el('p', 'twc-help', '用酒馆当前模型提取世界书里的角色名、外貌和服装。'));
     const referenceStatus = el('p', 'twc-help twc-reference-status'); referenceStatus.setAttribute('role', 'status'); sources.append(referenceStatus);
-    const referenceDetails = el('details', 'twc-references'); referenceDetails.hidden = true;
-    referenceDetails.append(el('summary', '', '已读取的人物资料与来源'));
-    const referenceData = el('pre', 'twc-reference-data'); referenceDetails.append(referenceData); sources.append(referenceDetails);
-    for (const input of [useBaiBai, useWorldbook]) input.addEventListener('change', () => {
-        referenceData.textContent = ''; referenceDetails.hidden = true; people.replaceChildren();
+    const referenceData = el('pre', 'twc-reference-data');
+    referenceData.hidden = true;
+    sources.append(referenceData);
+    useWorldbook.addEventListener('change', () => {
+        showPeople([]);
         referenceStatus.textContent = '来源已切换，下次读取或规划将使用当前开关。';
     });
     const prepActions = el('div', 'twc-actions'); prep.append(prepActions);
@@ -864,28 +862,47 @@ async function openEditor(index) {
     });
     footer.append(stops);
     const controls = [];
-    const sourceOptions = () => ({ useBaiBai: useBaiBai.checked === true, useWorldbook: useWorldbook.checked === true });
-    async function readReferences() {
+    const sourceOptions = () => ({ useWorldbook: useWorldbook.checked === true });
+    let lastExtraction;
+    async function readReferences(extract = false) {
         ensureFresh(); referenceStatus.textContent = '正在只读收集人物资料，不调用模型……';
-        const result = await collectReferences(context(), { floor: bound.index, source: source.value, appearance: appearance.value, ...sourceOptions() });
-        ensureFresh();
-        if (halted) throw new Error('任务已停止，未使用本次资料。');
-        const cache = await reuseCharacterProfiles(context(), { floor: bound.index, ...sourceOptions() }, result);
+        const result = await collectReferences(context(), { floor: bound.index, source: cleanStoryboardSource(source.value), appearance: appearance.value, ...sourceOptions() });
         ensureFresh();
         if (halted) throw new Error('任务已停止，未使用本次资料。');
         const { context: references, receipt, warnings } = result;
+        if (references.worldbooks.length) {
+            const signature = JSON.stringify(references.worldbooks);
+            if (extract) {
+                const busy = await readHostGenerationState(context());
+                ensureFresh();
+                if (halted) throw new Error('任务已停止，未提取人物资料。');
+                if (busy) throw new Error('酒馆正在处理其他生成请求，请稍后再提取。');
+                status.textContent = '正在使用酒馆当前模型提取世界书人物……';
+                const profiles = await extractWorldbookProfiles(context(), references.worldbooks, config.responseLength);
+                ensureFresh();
+                if (halted) throw new Error('任务已停止，未保存人物资料。');
+                lastExtraction = { signature, profiles };
+            }
+            if (lastExtraction?.signature === signature) references.extractedProfiles = lastExtraction.profiles;
+        }
+        const cache = await reuseCharacterProfiles(context(), { floor: bound.index, ...sourceOptions() }, result);
+        ensureFresh();
+        if (halted) throw new Error('任务已停止，未使用本次资料。');
+        receipt.extracted = references.extractedProfiles?.length ?? 0;
         receipt.characterCacheSaved = cache.saved;
         receipt.characterCacheReused = cache.reused.length;
-        referenceDetails.hidden = false;
         showPeople([...observedProfiles(references), ...cache.reused]);
-        referenceData.textContent = JSON.stringify({ context: references, receipt, warnings, reusedCharacterProfiles: cache.reused }, null, 2);
-        const names = { off: '关闭', unavailable: '未取得', partial: '有缺口', complete: '已读取', read: '已读取' };
+        const names = { off: '关闭', unavailable: '未取得', read: '已读取' };
         const cacheStatus = `${cache.saved ? `当前角色卡已保存 ${cache.saved} 条人物缓存。` : ''}${cache.reused.length ? `本次复用 ${cache.reused.length} 条人物缓存。` : ''}`;
-        referenceStatus.textContent = `柏宝书：${names[receipt.baiBai]}；世界书：${names[receipt.worldbook]}（${receipt.entries} 条）；前文 ${receipt.previousMessages} 条。${cacheStatus}${warnings.length ? '\n' + warnings.join('\n') : ''}`;
+        const worldWarnings = warnings.filter(warning => /世界书|人物缓存/u.test(warning));
+        referenceStatus.textContent = `世界书${names[receipt.worldbook]}，人物候选 ${receipt.entries} 条。${cacheStatus}${worldWarnings.length ? '\n' + worldWarnings.join('\n') : ''}`;
         return { context: references, receipt, warnings, reused: cache.reused };
     }
     const readButton = button('读取人物资料', () => withBusy(async () => {
-        await readReferences(); status.textContent = '人物资料已读取，未调用模型。请查看来源和缺口，再规划分页。';
+        const { receipt } = await readReferences(true);
+        status.textContent = receipt.entries
+            ? `模型提取了 ${receipt.extracted} 条人物资料。`
+            : '本次没有可供模型提取的世界书条目。请核对来源，也可以直接规划。';
     }));
     const planButton = button('规划分页', planCurrent, 'twc-primary');
     function addPlanControls(parent, plan) {
@@ -904,7 +921,10 @@ async function openEditor(index) {
     }
     function planCurrent() {
         return withBusy(async () => {
-            ensureFresh(); status.textContent = '正在读取本次选定来源的人物资料……';
+            ensureFresh();
+            source.value = cleanStoryboardSource(source.value);
+            if (!source.value.trim()) throw new Error('清理推理标签和状态占位符后没有可改编的正文。');
+            status.textContent = '正在读取本次选定来源的人物资料……';
             const references = await readReferences();
             const busy = await readHostGenerationState(context());
             ensureFresh();
@@ -936,7 +956,7 @@ async function openEditor(index) {
     const modeHelp = el('p', 'twc-help');
     prepActions.append(modeHelp);
     const prepMode = addPlanControls(prepActions, planButton);
-    controls.push(planButton, storyPlanButton, prepMode, storyMode, generateAll, planSave, checkState, readButton, useBaiBai, useWorldbook, multiFormat, singleFormat, legacyFormat, detailButton);
+    controls.push(planButton, storyPlanButton, prepMode, storyMode, generateAll, planSave, checkState, readButton, useWorldbook, multiFormat, singleFormat, legacyFormat, detailButton);
     controls.push(responseLimit, plannerRules, singlePlannerRules, ...Object.values(templateBoxes), saveRules, resetRules, applyTemplates);
     options.append(checkState);
     outputBar.append(generateAll);
@@ -973,14 +993,12 @@ async function openEditor(index) {
             const draft = drafts.get(next);
             const values = draft ?? record ?? fields;
             const options = draft ?? record?.sourceOptions ?? fields;
-            source.value = values.source ?? bound.text;
+            source.value = values.source ?? cleanOriginal;
             appearance.value = values.appearance ?? config.appearance;
             style.value = values.style === LEGACY_STYLE ? config.style : values.style ?? config.style;
-            useBaiBai.checked = options.useBaiBai === true;
             useWorldbook.checked = options.useWorldbook === true;
-            referenceData.textContent = ''; referenceDetails.hidden = true; referenceStatus.textContent = '';
-            people.replaceChildren();
-            if (record?.referenceContext) showPeople(observedProfiles(record.referenceContext));
+            referenceStatus.textContent = '';
+            showPeople(record?.referenceContext && useWorldbook.checked ? observedProfiles(record.referenceContext) : []);
             selectedStory = 0;
         }
         mode = next;
@@ -1081,8 +1099,20 @@ async function openEditor(index) {
         }
     }
     function showPeople(profiles) {
-        people.replaceChildren();
-        for (const name of new Set(profiles.map(profile => profile.name))) people.append(el('span', 'twc-person', name));
+        const byName = new Map();
+        for (const profile of profiles) {
+            const key = profile.name.toLocaleLowerCase();
+            const first = byName.get(key);
+            if (!first) byName.set(key, { ...profile });
+            else if (first.book === profile.book) {
+                first.description ||= profile.description;
+                first.outfit ||= profile.outfit;
+            }
+        }
+        const compact = value => value?.replace(/\s*\r?\n\s*/gu, '；') || '未注明';
+        referenceData.hidden = !byName.size;
+        referenceData.textContent = [...byName.values()].map(({ name, description, outfit }) =>
+            `角色名：${name}\n外貌：${compact(description)}\n服装：${compact(outfit)}`).join('\n\n');
     }
     function renderStoryboard() {
         const { scrollLeft, scrollTop } = storyRail;
@@ -1266,7 +1296,7 @@ async function openEditor(index) {
     });
     owner.refreshControls = syncControls;
     document.body.append(dialog);
-    if (record?.referenceContext) showPeople(observedProfiles(record.referenceContext));
+    if (record?.referenceContext && useWorldbook.checked) showPeople(observedProfiles(record.referenceContext));
     renderPlan();
     showStage(record && ([...record.pages, ...(record.singlePages ?? [])].some(page => page.image)) ? 2 : record ? 1 : 0);
     dialog.showModal();

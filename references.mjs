@@ -1,6 +1,9 @@
 // Read-only adapter. Never calls summarization, saveWorldInfo, write APIs or native WI activation.
 let worldModule;
 const loadWorldModule = () => worldModule ??= import('/scripts/world-info.js').catch(error => { worldModule = undefined; throw error; });
+const PROFILE_TITLE = /人物设定|角色设定|人物档案|角色档案|人物资料|角色资料|人物外貌|角色外貌|(?:character|npc)[ _-]*(?:profile|sheet|appearance)/iu;
+const VISUAL_TRAITS = /外貌|外观|容貌|五官|脸型|发型|发色|瞳色|眼睛|头发|[长短黑白银金红棕灰]发|服装|衣着|穿着|身穿|着装|(?:\b(?:hair|eyes|outfit|appearance|clothes|attire)\b)/iu;
+const NON_PROFILE_TITLE = /^\[(?:mvu|generate|preprocessing)|控制器|输出格式|生成规则|叙事规则|AI叙事/iu;
 
 export function resolveReferenceCard(ctx, floor) {
     if (!ctx.groupId) return ctx.characters?.[ctx.characterId];
@@ -11,7 +14,7 @@ export function resolveReferenceCard(ctx, floor) {
 }
 
 export async function collectReferences(ctx, options, dependencies = {}) {
-    const { floor, source = '', appearance = '', useBaiBai = false, useWorldbook = false } = options;
+    const { floor, source = '', appearance = '', useWorldbook = false } = options;
     if (!Number.isInteger(floor) || floor < 0 || floor >= (ctx.chat?.length ?? 0)) throw new Error('人物资料读取的目标消息不存在。');
     const warnings = new Set(); let remaining = 28000;
     function take(value, limit, label) {
@@ -31,42 +34,9 @@ export async function collectReferences(ctx, options, dependencies = {}) {
     const cast = new Set([ctx.name1, ctx.name2, targetName, character?.name, ...previousMessages.map(x => x.name)].filter(x => typeof x === 'string' && x.trim()));
     const matchText = `${source}\n${appearance}\n${previousMessages.map(x => x.text).join('\n')}\n${[...cast].join('\n')}`.toLocaleLowerCase();
     const characterCards = character ? [{ name: character.name || ctx.name2 || '', description: take(character.description ?? character.data?.description, 4000, '角色卡说明') }] : [];
-    const context = { floor, previousMessages, characterCards, baiBai: null, worldbooks: [] };
-    const receipt = { floor, previousMessages: previousMessages.length, baiBai: useBaiBai ? 'unavailable' : 'off', worldbook: useWorldbook ? 'unavailable' : 'off', books: [], entries: 0 };
+    const context = { floor, previousMessages, characterCards, worldbooks: [] };
+    const receipt = { floor, previousMessages: previousMessages.length, worldbook: useWorldbook ? 'unavailable' : 'off', books: [], entries: 0 };
 
-    function person(value) {
-        if (!value || typeof value !== 'object') return {};
-        const keys = ['id', 'name', 'gender', 'age', 'title', 'desc', 'outfit', 'condition'];
-        return Object.fromEntries(keys.filter(key => typeof value[key] === 'string' && value[key]).map(key => [key, take(value[key], 1000, '人物资料')]));
-    }
-    function snapshot(value) {
-        const npcs = (Array.isArray(value.npcs) ? value.npcs : []).filter(n => typeof n.name === 'string' && n.name.length > 1 && matchText.includes(n.name.toLocaleLowerCase()));
-        if (npcs.length > 12) warnings.add('相关人物超过12名，已按名册顺序截取，请核对角色是否遗漏。');
-        return { npcs: npcs.slice(0, 12).map(n => person(n)) };
-    }
-    if (useBaiBai) {
-        try {
-            // Access global object only when this source is explicitly enabled.
-            const api = (dependencies.getBaiBai ?? (() => globalThis.STBaiBaiBook))();
-            if (api?.apiVersion !== 1 || typeof api.getSnapshot !== 'function') throw new Error();
-            const before = await api.getSnapshot({ floor, at: 'before' });
-            const after = await api.getSnapshot({ floor, at: 'after' });
-            const chatId = ctx.getCurrentChatId?.() ?? ctx.chatId;
-            if (before?.chat?.id !== chatId || after?.chat?.id !== chatId
-                || before?.point?.floor !== floor || before.point.at !== 'before' || after?.point?.floor !== floor || after.point.at !== 'after') {
-                warnings.add('柏宝书返回的聊天或时间点不匹配，已排除该来源资料。');
-            } else {
-                context.baiBai = {
-                    pluginVersion: typeof api.pluginVersion === 'string' ? api.pluginVersion : '',
-                    before: snapshot(before), after: snapshot(after),
-                    coverage: { complete: after.coverage?.complete === true, missingAiFloors: (after.coverage?.missingAiFloors ?? []).filter(Number.isInteger).slice(0, 100) },
-                };
-                receipt.baiBai = context.baiBai.coverage.complete ? 'complete' : 'partial';
-                if (!context.baiBai.coverage.complete) warnings.add('柏宝书有摘要覆盖缺口，人物资料可能不完整；不会自动补摘或改写记忆。');
-                if (!context.baiBai.before.npcs.length && !context.baiBai.after.npcs.length) warnings.add('柏宝书角色名册中未匹配到本轮人物，可在人物补充中填写姓名后重新读取。');
-            }
-        } catch { warnings.add('柏宝书公开只读接口尚未就绪或读取失败，本次未取得该来源资料。'); }
-    }
     if (useWorldbook) {
         try {
             if (typeof ctx.loadWorldInfo !== 'function') throw new Error();
@@ -85,6 +55,8 @@ export async function collectReferences(ctx, options, dependencies = {}) {
             }
             if (names.size > 8) warnings.add('关联世界书超过8本，本次只读取前8本，请核对来源范围。');
             receipt.books = [...names].slice(0, 8); receipt.worldbook = 'read';
+            const candidates = [];
+            const namedProfiles = [];
             for (const book of receipt.books) {
                 let data;
                 try { data = await ctx.loadWorldInfo(book); }
@@ -93,18 +65,24 @@ export async function collectReferences(ctx, options, dependencies = {}) {
                 for (const entry of Object.values(data.entries)) {
                     if (!entry || entry.disable === true || entry.enabled === false || typeof entry.content !== 'string') continue;
                     const keys = Array.isArray(entry.key) ? entry.key : [];
-                    const keyMatch = keys.some(k => typeof k === 'string' && k.trim() && !(k.startsWith('/') && k.lastIndexOf('/') > 0) && matchText.includes(k.toLocaleLowerCase()));
                     const title = typeof entry.comment === 'string' ? entry.comment : '';
+                    const tagged = PROFILE_TITLE.test(title);
+                    if (NON_PROFILE_TITLE.test(title.trim()) || (!tagged && !VISUAL_TRAITS.test(entry.content.slice(0, 3000)))) continue;
+                    const keyMatch = keys.some(k => typeof k === 'string' && k.trim() && !(k.startsWith('/') && k.lastIndexOf('/') > 0) && matchText.includes(k.toLocaleLowerCase()));
                     const titleMatch = title.length >= 2 && matchText.includes(title.toLocaleLowerCase());
                     const castMatch = [...cast].some(name => name.length >= 2 && `${title}\n${entry.content}`.includes(name));
-                    if (!keyMatch && !titleMatch && !castMatch) continue;
-                    if (context.worldbooks.length >= 24 || remaining <= 0) { warnings.add('世界书候选超过24条或资料预算，已截取，请核对遗漏。'); break; }
-                    context.worldbooks.push({ book, uid: entry.uid ?? null, title, keys: keys.filter(x => typeof x === 'string').slice(0, 16), content: take(entry.content, 3000, '世界书条目') });
+                    const candidate = { book, uid: entry.uid ?? null, title, keys: keys.filter(x => typeof x === 'string').slice(0, 16), content: entry.content };
+                    if (keyMatch || titleMatch || castMatch) candidates.push(candidate);
+                    else if (tagged) namedProfiles.push(candidate);
                 }
+            }
+            for (const candidate of [...candidates, ...namedProfiles]) {
+                if (context.worldbooks.length >= 24 || remaining <= 0) { warnings.add('世界书人物候选超过24条或资料预算，已截取。'); break; }
+                context.worldbooks.push({ ...candidate, content: take(candidate.content, 3000, '世界书人物条目') });
             }
             receipt.entries = context.worldbooks.length;
             if (!receipt.books.length) warnings.add('未找到当前角色、聊天或全局绑定的世界书；不会扫描其他未关联书。');
-            else if (!receipt.entries) warnings.add('关联世界书中未找到启用且匹配人物/正文的条目。');
+            else if (!receipt.entries) warnings.add('关联世界书中未找到可提取的人物条目。');
         } catch { warnings.add('世界书只读能力不可用，本次未取得该来源资料。'); }
     }
     return { context, warnings: [...warnings], receipt, matchText };
