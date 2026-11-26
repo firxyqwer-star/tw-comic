@@ -1,4 +1,4 @@
-import { cleanStoryboardSource, segmentSource, validatePlan, sceneIssues, shortSceneBatch, dialogueWarnings, DIALOGUE_WARNING_PREFIX, buildPagePrompt, buildSingleFramePrompt, singleFrames, DEFAULT_STORYBOARD_RULES, DEFAULT_SINGLE_STORYBOARD_RULES, DEFAULT_IMAGE_TEMPLATES, validateImageTemplate, fillWorkflow, workflowNodes, prepareComfyWorkflow, COMFY_WORKFLOW_FIELDS, bindingMatches, runPages } from './core.mjs';
+import { cleanStoryboardSource, filterStoryboardSource, segmentSource, validatePlan, sceneIssues, shortSceneBatch, dialogueWarnings, DIALOGUE_WARNING_PREFIX, buildPagePrompt, buildSingleFramePrompt, singleFrames, DEFAULT_STORYBOARD_RULES, DEFAULT_SINGLE_STORYBOARD_RULES, DEFAULT_IMAGE_TEMPLATES, validateImageTemplate, fillWorkflow, workflowNodes, prepareComfyWorkflow, COMFY_WORKFLOW_FIELDS, bindingMatches, runPages } from './core.mjs';
 import { checkHost, planWithCurrentConnection, detailScenesWithCurrentConnection, extractWorldbookProfiles, generateImage, normalizeComfyUrl, testComfyConnection, testNovelConnection, testWebUiConnection, readHostGenerationState, saveNovelKey, describeHistoryChat, listHistoryChats, readHistoryChat, HISTORY_CHAT_LIMIT } from './services.mjs';
 import { collectReferences } from './references.mjs';
 import { cleanCharacterProfiles, observedProfiles, reuseCharacterProfiles } from './character-cache.mjs';
@@ -760,26 +760,139 @@ async function openEditor(index) {
     const plannerRules = field(ruleBox, '多格分镜提示词', config.storyboardRules || DEFAULT_STORYBOARD_RULES); plannerRules.rows = 10;
     const singlePlannerRules = field(ruleBox, '单格分镜提示词', config.singleStoryboardRules || DEFAULT_SINGLE_STORYBOARD_RULES); singlePlannerRules.rows = 10;
     ruleBox.append(el('p', 'twc-help', '插件会自动附上对应模式的 JSON 格式、段落编号和每格最低字数要求。'));
+    const sceneRules = el('details', 'twc-disclosure');
+    sceneRules.append(el('summary', '', '场景规则'));
+    const sceneGuide = field(sceneRules, '补充分镜写法', config.sceneGuide ?? '');
+    sceneGuide.rows = 5;
+    const fillSceneGuide = button('填入场景示例', () => {
+        sceneGuide.value = '每格定格在动作最清楚的一瞬。交代景别、人物站位、身体朝向、动作主体和对象。接触点、重心和持物位置按镜头需要注明。只写取景范围内可见的特征。相邻分格可变换景别，保持人物与道具位置连续。';
+    });
+    const saveSceneGuide = button('保存场景规则', () => {
+        config.sceneGuide = sceneGuide.value.trim();
+        context().saveSettingsDebounced();
+        status.textContent = '场景规则已保存，下次规划时生效。';
+    });
+    sceneRules.append(el('p', 'twc-help', '单格和多格共用。留空时使用既有分镜规则。'), fillSceneGuide, saveSceneGuide);
+    ruleBox.append(sceneRules);
+    const templateSection = el('section', 'twc-surface twc-image-templates');
+    rules.append(templateSection);
+    templateSection.append(el('h3', '', '生图提示词模板'));
+    const presetBar = el('div', 'twc-template-toolbar');
+    templateSection.append(presetBar);
+    const presetLabel = el('label', 'twc-field');
+    const presetSelect = el('select', 'text_pole');
+    presetLabel.append(el('span', '', '当前预设'), presetSelect);
+    presetBar.append(presetLabel);
+    const presetName = field(presetBar, '预设名称', '', false);
     const templateBoxes = {};
     for (const [mode, label, keys] of [
         ['multi', '多格生图提示词', '{{分镜}} 必填。可用 {{画风}}、{{人物}}、{{页码}}、{{总页数}}、{{标题}}、{{格数}}、{{情绪}}。'],
         ['single', '单格生图提示词', '{{画面}} 和 {{文字}} 必填。可用 {{画风}}、{{人物}}、{{标题}}、{{情绪}}。'],
     ]) {
-        templateBoxes[mode] = field(ruleBox, label, config.imageTemplates?.[mode] || DEFAULT_IMAGE_TEMPLATES[mode]);
+        const fold = el('details', 'twc-disclosure');
+        fold.append(el('summary', '', label));
+        templateBoxes[mode] = field(fold, '模板正文', config.imageTemplates?.[mode] || DEFAULT_IMAGE_TEMPLATES[mode]);
         templateBoxes[mode].rows = 7;
-        ruleBox.append(el('p', 'twc-help', keys));
+        fold.append(el('p', 'twc-help', keys));
+        templateSection.append(fold);
     }
+    const tagRules = el('details', 'twc-disclosure');
+    tagRules.append(el('summary', '', '模型 Tag 指南'));
+    const tagGuide = field(tagRules, '当前预设的标签写法', config.imageTemplates?.tagGuide ?? '');
+    tagGuide.rows = 5;
+    const fillTagGuide = button('填入英文 Tag 示例', () => {
+        tagGuide.value = '用逗号分隔的简短英文标签描述可见外貌、服装、环境和光影。顺序为主体、外貌、服装、动作与表情、环境、光影和镜头。复杂动作、接触点和多人位置用完整短句，明确角色与动作的归属。只填当前镜头可见的信息。';
+    });
+    tagRules.append(el('p', 'twc-help', '随生图预设保存。下次规划时指导模型组织画面描述，留空沿用原有写法。'), fillTagGuide);
+    templateSection.append(tagRules);
+    const presets = config.imageTemplatePresets ??= [];
+    const selection = () => presets.find(preset => preset.id === config.activeImageTemplatePreset);
+    const editorStatus = el('p', 'twc-help');
+    editorStatus.setAttribute('role', 'status');
+    function renderPresets() {
+        presetSelect.replaceChildren(...[{ id: '', name: '默认预设' }, ...presets].map(preset => {
+            const option = el('option', '', preset.name);
+            option.value = preset.id;
+            return option;
+        }));
+        presetSelect.value = selection()?.id ?? '';
+        presetName.value = selection()?.name ?? '';
+        deletePreset.disabled = !selection();
+    }
+    function loadPreset(templates) {
+        for (const mode of Object.keys(templateBoxes)) templateBoxes[mode].value = templates?.[mode] || DEFAULT_IMAGE_TEMPLATES[mode];
+        tagGuide.value = templates?.tagGuide ?? '';
+    }
+    function draftTemplates() {
+        const templates = Object.fromEntries(Object.entries(templateBoxes).map(([mode, box]) => {
+            const template = box.value.trim() || DEFAULT_IMAGE_TEMPLATES[mode];
+            validateImageTemplate(template, mode);
+            return [mode, template === DEFAULT_IMAGE_TEMPLATES[mode] ? '' : template];
+        }));
+        const guide = tagGuide.value.trim();
+        return guide ? { ...templates, tagGuide: guide } : templates;
+    }
+    function writeTemplates(templates, create = false) {
+        const preset = selection();
+        if (create || preset) {
+            const name = presetName.value.trim() || (create ? '' : preset.name);
+            if (!name || name.length > 60) throw new Error('请输入 1～60 字的预设名称。');
+            if (name === '默认预设' || presets.some(item => item.name === name && (create || item !== preset))) {
+                throw new Error('该预设名称已存在。');
+            }
+            if (create) {
+                const id = newComicId();
+                presets.push({ id, name, templates });
+                config.activeImageTemplatePreset = id;
+            } else Object.assign(preset, { name, templates });
+        }
+        config.imageTemplates = templates;
+        renderPresets();
+    }
+    presetSelect.addEventListener('change', () => {
+        if (!selection()) config.defaultImageTemplates = { ...config.imageTemplates };
+        config.activeImageTemplatePreset = presetSelect.value;
+        config.imageTemplates = { ...(selection()?.templates ?? config.defaultImageTemplates) };
+        loadPreset(config.imageTemplates);
+        renderPresets();
+        context().saveSettingsDebounced();
+        editorStatus.textContent = '预设已切换。';
+    });
+    function savePreset(create) {
+        try {
+            writeTemplates(draftTemplates(), create);
+            context().saveSettingsDebounced();
+            editorStatus.textContent = '生图预设已保存。';
+        } catch (error) { editorStatus.textContent = error.message; }
+    }
+    const newPreset = button('另存为预设', () => {
+        if (!selection()) config.defaultImageTemplates = { ...config.imageTemplates };
+        savePreset(true);
+    });
+    const saveImagePreset = button('保存当前预设', () => savePreset(false), 'twc-primary');
+    const deletePreset = button('删除预设', () => {
+        const preset = selection();
+        if (!preset || !globalThis.confirm(`删除预设「${preset.name}」？`)) return;
+        presets.splice(presets.indexOf(preset), 1);
+        config.activeImageTemplatePreset = '';
+        config.imageTemplates = { ...config.defaultImageTemplates };
+        loadPreset(config.imageTemplates);
+        renderPresets();
+        context().saveSettingsDebounced();
+        editorStatus.textContent = '预设已删除，已切换到默认预设。';
+    });
+    const resetTemplate = button('恢复内置模板', () => {
+        loadPreset(DEFAULT_IMAGE_TEMPLATES);
+        editorStatus.textContent = '已填入内置模板，保存后生效。';
+    });
     const ruleActions = el('div', 'twc-actions'); ruleBox.append(ruleActions);
     const saveRules = button('保存规则', () => {
         try {
             const limit = Number(responseLimit.value);
             if (!Number.isInteger(limit) || limit < 1024 || limit > 64000) throw new Error('输出上限应为 1024～64000 的整数。');
-            const multi = templateBoxes.multi.value.trim() || DEFAULT_IMAGE_TEMPLATES.multi;
-            const single = templateBoxes.single.value.trim() || DEFAULT_IMAGE_TEMPLATES.single;
-            validateImageTemplate(multi, 'multi'); validateImageTemplate(single, 'single');
+            writeTemplates(draftTemplates());
             config.storyboardRules = plannerRules.value.trim() === DEFAULT_STORYBOARD_RULES ? '' : plannerRules.value.trim();
             config.singleStoryboardRules = singlePlannerRules.value.trim() === DEFAULT_SINGLE_STORYBOARD_RULES ? '' : singlePlannerRules.value.trim();
-            config.imageTemplates = { multi: multi === DEFAULT_IMAGE_TEMPLATES.multi ? '' : multi, single: single === DEFAULT_IMAGE_TEMPLATES.single ? '' : single };
             config.responseLength = limit;
             context().saveSettingsDebounced();
             status.textContent = '规则已保存，下次规划会使用新规则。';
@@ -789,17 +902,86 @@ async function openEditor(index) {
         responseLimit.value = DEFAULT_PREFERENCES.responseLength;
         plannerRules.value = DEFAULT_STORYBOARD_RULES;
         singlePlannerRules.value = DEFAULT_SINGLE_STORYBOARD_RULES;
-        templateBoxes.multi.value = DEFAULT_IMAGE_TEMPLATES.multi;
-        templateBoxes.single.value = DEFAULT_IMAGE_TEMPLATES.single;
+        loadPreset(DEFAULT_IMAGE_TEMPLATES);
         status.textContent = '已填入默认值，点击「保存规则」生效。';
     });
     const applyTemplates = button('将已保存的模板应用到当前分镜', () => withBusy(async () => {
         ensureFresh();
         if (!record || hasUnsavedPlanEdits()) throw new Error('请先保存当前分镜中的修改。');
-        await savePlanEdits(record.plan, config.imageTemplates);
+        await savePlanEdits(record.plan, config.imageTemplates, { applyTemplate: true });
         status.textContent = '当前分镜的生图提示词已更新。';
     }));
-    ruleActions.append(saveRules, resetRules, applyTemplates);
+    const templateActions = el('div', 'twc-actions');
+    templateActions.append(saveImagePreset, newPreset, deletePreset, resetTemplate, applyTemplates);
+    templateSection.append(templateActions, editorStatus);
+    const inspect = el('details', 'twc-disclosure');
+    inspect.append(el('summary', '', '请求预览与最近一次提交'));
+    const refreshPreview = button('预览当前草稿', () => {
+        try {
+            if (!record) throw new Error('请先规划分镜，再预览生图请求。');
+            const templates = draftTemplates();
+            const prompts = primaryPrompts(record.plan, outputMode, style.value, appearance.value, templates);
+            const index = Math.min(selectedOutput, prompts.length - 1);
+            const unit = outputMode === 'single' ? '格' : '页';
+            pendingPreview.textContent = `第 ${index + 1} ${unit}\n\n${prompts[index] ?? ''}`;
+        } catch (error) { pendingPreview.textContent = error.message; }
+    });
+    const pendingPreview = el('pre', 'twc-reference-data');
+    const lastPreview = el('pre', 'twc-reference-data');
+    function renderRecentRequest() {
+        const request = record && owner.lastImageRequests?.get(record);
+        lastPreview.textContent = request ? JSON.stringify(request, null, 2) : '本次打开酒馆后，这份分镜暂无生图提交记录。';
+    }
+    inspect.addEventListener('toggle', renderRecentRequest);
+    inspect.append(el('p', 'twc-help', '预览使用编辑中的模板。最近一次提交显示后端、种子和实际使用的提示词。'), refreshPreview, pendingPreview, el('h4', '', '最近一次提交'), lastPreview);
+    templateSection.append(inspect);
+    ruleActions.append(saveRules, resetRules);
+    renderPresets();
+    const filters = el('details', 'twc-disclosure twc-message-filters');
+    filters.append(el('summary', '', '消息过滤规则'));
+    rules.append(filters);
+    const filterFields = el('fieldset', 'twc-filter-fields');
+    filters.append(filterFields);
+    const filterEnabled = toggle(filterFields, '启用消息过滤规则', config.filterStoryboardMessages);
+    filterFields.append(el('p', 'twc-help', '只处理待改编正文。留空的起止标记分别代表消息开头和末尾。两个标记都填写时，只有完整匹配的片段会被过滤。勾选「发给 AI」可将片段作为参考，图片只插在正文。'));
+    const filterRows = el('div');
+    filterFields.append(filterRows);
+    const rowReaders = new Map();
+    function addFilterRow({ start = '', end = '', send = false } = {}) {
+        const row = el('div', 'twc-filter-row');
+        const from = field(row, '起始标记', start, false);
+        const to = field(row, '结束标记', end, false);
+        const sendToModel = toggle(row, '发给 AI', send);
+        const remove = button('删除此行', () => { rowReaders.delete(row); row.remove(); });
+        row.append(remove);
+        rowReaders.set(row, () => ({ start: from.value, end: to.value, send: sendToModel.checked }));
+        filterRows.append(row);
+    }
+    for (const rule of config.storyboardMessageFilters ?? []) addFilterRow(rule);
+    const filterActions = el('div', 'twc-actions');
+    filterActions.append(
+        button('添加过滤规则', () => addFilterRow()),
+        button('填入常见规则', () => {
+            const pairs = ['think', 'thinking', 'system', 'meta', 'options', 'WorldState', 'state', 'UpdateVariable'].map(tag => [`<${tag}>`, `</${tag}>`]);
+            pairs.push(['<!--', '-->']);
+            for (const [start, end] of pairs) {
+                if (![...rowReaders.values()].some(read => read().start === start && read().end === end)) addFilterRow({ start, end });
+            }
+        }),
+        button('保存过滤规则', () => {
+            config.storyboardMessageFilters = [...rowReaders.values()].map(read => read()).filter(rule => rule.start || rule.end);
+            config.filterStoryboardMessages = filterEnabled.checked;
+            context().saveSettingsDebounced();
+            status.textContent = '过滤规则已保存，下次规划时生效。';
+        }, 'twc-primary'),
+    );
+    filterFields.append(filterActions);
+    function planningSource() {
+        const activeFilters = config.filterStoryboardMessages ? config.storyboardMessageFilters ?? [] : [];
+        const fromOriginal = source.value === cleanOriginal || (record?.sourceFromOriginal === true && source.value === record.source);
+        const raw = fromOriginal ? bound.text : source.value;
+        return { ...filterStoryboardSource(raw, activeFilters), fromOriginal };
+    }
     const storyActions = el('div', 'twc-output-bar');
     const storyPlanButton = button('规划当前模式', planCurrent, 'twc-primary');
     const storyMode = addPlanControls(storyActions, storyPlanButton);
@@ -866,7 +1048,7 @@ async function openEditor(index) {
     let lastExtraction;
     async function readReferences(extract = false) {
         ensureFresh(); referenceStatus.textContent = '正在只读收集人物资料，不调用模型……';
-        const result = await collectReferences(context(), { floor: bound.index, source: cleanStoryboardSource(source.value), appearance: appearance.value, ...sourceOptions() });
+        const result = await collectReferences(context(), { floor: bound.index, source: planningSource().story, appearance: appearance.value, ...sourceOptions() });
         ensureFresh();
         if (halted) throw new Error('任务已停止，未使用本次资料。');
         const { context: references, receipt, warnings } = result;
@@ -922,8 +1104,8 @@ async function openEditor(index) {
     function planCurrent() {
         return withBusy(async () => {
             ensureFresh();
-            source.value = cleanStoryboardSource(source.value);
-            if (!source.value.trim()) throw new Error('清理推理标签和状态占位符后没有可改编的正文。');
+            const { story, context: filteredContext, fromOriginal } = planningSource();
+            if (!story.trim()) throw new Error('过滤后没有可改编的正文。');
             status.textContent = '正在读取本次选定来源的人物资料……';
             const references = await readReferences();
             const busy = await readHostGenerationState(context());
@@ -933,11 +1115,13 @@ async function openEditor(index) {
             status.textContent = '正在使用酒馆当前连接规划，请等待。不会发送正常角色回复。';
             const planningContext = references.reused.length ? { ...references.context, cachedCharacterProfiles: references.reused } : references.context;
             const result = await planWithCurrentConnection(context(), {
-                source: source.value, appearance: appearance.value, style: style.value, responseLength: config.responseLength,
+                source: story, appearance: appearance.value, style: style.value, responseLength: config.responseLength,
                 references: planningContext, storyboardRules: mode === 'single' ? config.singleStoryboardRules : config.storyboardRules, mode,
+                guidance: { sceneGuide: config.sceneGuide, tagGuide: config.imageTemplates?.tagGuide, filteredContext },
             });
             if (!current(bound) || halted) throw new Error('任务已停止或聊天已变化，未写入规划结果。');
-            await saveNewPlan(result.plan, references, result.warnings);
+            source.value = story;
+            await saveNewPlan(result.plan, references, result.warnings, fromOriginal);
             const count = scenesToReview().size;
             const unit = mode === 'single' ? '格' : '页';
             status.textContent = `已规划 ${record.pages.length} ${unit}。${count ? `其中 ${count} ${unit}的画面描述需要修正，可在「分镜」中直接修改。` : '请核对分镜和对白。'}`;
@@ -957,7 +1141,7 @@ async function openEditor(index) {
     prepActions.append(modeHelp);
     const prepMode = addPlanControls(prepActions, planButton);
     controls.push(planButton, storyPlanButton, prepMode, storyMode, generateAll, planSave, checkState, readButton, useWorldbook, multiFormat, singleFormat, legacyFormat, detailButton);
-    controls.push(responseLimit, plannerRules, singlePlannerRules, ...Object.values(templateBoxes), saveRules, resetRules, applyTemplates);
+    controls.push(responseLimit, plannerRules, singlePlannerRules, ...Object.values(templateBoxes), saveRules, resetRules, applyTemplates, presetSelect, presetName, newPreset, saveImagePreset, deletePreset, resetTemplate, refreshPreview, tagGuide, fillTagGuide, sceneGuide, fillSceneGuide, saveSceneGuide, filterFields);
     options.append(checkState);
     outputBar.append(generateAll);
 
@@ -968,11 +1152,11 @@ async function openEditor(index) {
         record.updated = Date.now();
         await saveRecord(bound, record); renderMessages();
     }
-    async function saveNewPlan(plan, references, warnings) {
+    async function saveNewPlan(plan, references, warnings, fromOriginal) {
         const referenceWarnings = references.warnings ?? [];
         const promptTemplates = { ...config.imageTemplates };
         const pages = primaryPrompts(plan, mode, style.value, appearance.value, promptTemplates).map(prompt => ({ prompt, status: 'pending' }));
-        record = { id: newComicId(), original: bound.text, swipe: bound.swipe, storyboardMode: mode, source: source.value, appearance: appearance.value, style: style.value, sourceOptions: sourceOptions(), referenceContext: references.context, referenceReceipt: references.receipt, referenceWarnings, reviewScenes: true, plan, promptTemplates, warnings: [...referenceWarnings, ...warnings], pages };
+        record = { id: newComicId(), original: bound.text, swipe: bound.swipe, storyboardMode: mode, source: source.value, sourceFromOriginal: fromOriginal, appearance: appearance.value, style: style.value, sourceOptions: sourceOptions(), referenceContext: references.context, referenceReceipt: references.receipt, referenceWarnings, reviewScenes: true, plan, promptTemplates, warnings: [...referenceWarnings, ...warnings], pages };
         legacyOutput = false;
         outputMode = mode;
         selectedStory = 0; selectedOutput = 0;
@@ -1008,18 +1192,19 @@ async function openEditor(index) {
         renderPlan();
         if (record && drafts.has(mode)) planJSON.value = drafts.get(mode).json;
     }
-    async function savePlanEdits(plan, templates = record.promptTemplates) {
+    async function savePlanEdits(plan, templates = record.promptTemplates, { applyTemplate = false } = {}) {
         const previousImages = recordImages(record);
         const previousPlan = record.plan;
         const previousStyle = record.style;
         const previousAppearance = record.appearance;
         const previousTemplates = record.promptTemplates;
+        if (record.source !== source.value) record.sourceFromOriginal = false;
         record.plan = plan; record.source = source.value; record.appearance = appearance.value; record.style = style.value;
         record.promptTemplates = templates ? { ...templates } : undefined;
         const previousPrompts = primaryPrompts(previousPlan, mode, previousStyle, previousAppearance, previousTemplates);
         record.pages = primaryPrompts(plan, mode, record.style, record.appearance, templates).map((prompt, i) => {
             const previous = record.pages[i];
-            if (previous && prompt === previousPrompts[i]) return previous;
+            if (previous && (prompt === previous.prompt || (!applyTemplate && prompt === previousPrompts[i]))) return previous;
             return { image: previous?.image, stale: Boolean(previous?.image), prompt, status: 'pending' };
         });
         if (record.singlePages) {
@@ -1028,7 +1213,7 @@ async function openEditor(index) {
                 const previous = record.singlePages[i];
                 const oldFrame = previousFrames[i];
                 const prompt = buildSingleFramePrompt(plan, frame, record.style, record.appearance, templates?.single);
-                if (previous && oldFrame && prompt === buildSingleFramePrompt(previousPlan, oldFrame, previousStyle, previousAppearance, previousTemplates?.single)) return previous;
+                if (previous && (prompt === previous.prompt || (!applyTemplate && oldFrame && prompt === buildSingleFramePrompt(previousPlan, oldFrame, previousStyle, previousAppearance, previousTemplates?.single)))) return previous;
                 return { image: previous?.image, stale: Boolean(previous?.image), prompt, status: 'pending' };
             });
         }
@@ -1064,6 +1249,7 @@ async function openEditor(index) {
         generateAll.disabled = locked || !record;
         planSave.disabled = locked || !record;
         applyTemplates.disabled = locked || !record;
+        deletePreset.disabled = locked || !selection();
         for (const node of preview.querySelectorAll('button, textarea')) node.disabled = locked;
         for (const node of storyPage.querySelectorAll('textarea, .twc-save-scene')) node.disabled = locked;
         stops.disabled = !localBusy || halted || stopRequested;
@@ -1265,6 +1451,8 @@ async function openEditor(index) {
                 const seed = crypto.getRandomValues(new Uint32Array(1))[0]; page.seed = seed;
                 const filename = `comic-${record.id}-${outputMode === 'single' ? 'single-' : ''}${i + 1}-${Date.now()}`;
                 const graph = workflow && fillWorkflow(workflow, { prompt: page.prompt, seed, filename_prefix: `tw-comic/${filename}` });
+                (owner.lastImageRequests ??= new WeakMap()).set(record, { backend, ...(backend === 'novel' && { model: novelModel }), seed, prompt: page.prompt });
+                renderRecentRequest();
                 return generateImage(context(), { backend, url: address, graph, prompt: page.prompt, seed, model: novelModel, filename });
             }, () => !halted && !owner.destroyed && runtime === owner && current(bound), {
                 forceIndex, skipPage: i => review.has(i), shouldStop: () => stopRequested, onUpdate: async (page, i) => {

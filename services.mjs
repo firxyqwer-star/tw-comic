@@ -84,10 +84,10 @@ export async function extractWorldbookProfiles(ctx, worldbooks, responseLength) 
     });
 }
 
-export async function planWithCurrentConnection(ctx, { source, appearance = '', style = '', responseLength = 12000, references = null, storyboardRules = '', mode = 'multi' }) {
+export async function planWithCurrentConnection(ctx, { source, appearance = '', style = '', responseLength = 12000, references = null, storyboardRules = '', mode = 'multi', guidance }) {
     const story = cleanStoryboardSource(source);
     const segments = segmentSource(story);
-    const raw = await runPlanningRequest(ctx, plannerRequest(segments, appearance, style, responseLength, references, storyboardRules, mode));
+    const raw = await runPlanningRequest(ctx, plannerRequest(segments, appearance, style, responseLength, references, storyboardRules, mode, guidance));
     const plan = validatePlan(raw, segments.length, mode);
     return { plan, warnings: [...dialogueWarnings(story, plan), ...plan.notes.map(note => `人物资料核对：${note}`)], segments };
 }
