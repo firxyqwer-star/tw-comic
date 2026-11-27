@@ -760,12 +760,13 @@ async function openEditor(index) {
     const plannerRules = field(ruleBox, '多格分镜提示词', config.storyboardRules || DEFAULT_STORYBOARD_RULES); plannerRules.rows = 10;
     const singlePlannerRules = field(ruleBox, '单格分镜提示词', config.singleStoryboardRules || DEFAULT_SINGLE_STORYBOARD_RULES); singlePlannerRules.rows = 10;
     ruleBox.append(el('p', 'twc-help', '插件会自动附上对应模式的 JSON 格式、段落编号和每格最低字数要求。'));
+    ruleBox.append(el('p', 'twc-help', '单格会检查正文中省略的过程，按需补成独立镜头。补充镜头可在「分镜」修改，在「出图」选择是否参与批量生成。'));
     const sceneRules = el('details', 'twc-disclosure');
     sceneRules.append(el('summary', '', '场景规则'));
     const sceneGuide = field(sceneRules, '补充分镜写法', config.sceneGuide ?? '');
     sceneGuide.rows = 5;
     const fillSceneGuide = button('填入场景示例', () => {
-        sceneGuide.value = '每格定格在动作最清楚的一瞬。交代景别、人物站位、身体朝向、动作主体和对象。接触点、重心和持物位置按镜头需要注明。只写取景范围内可见的特征。相邻分格可变换景别，保持人物与道具位置连续。';
+        sceneGuide.value = '先定这一格最值得看的动作或反应，再按焦点选景别。近景突出表情，完整互动要留出手势和接触点。只写取景内未被遮挡的站位、朝向和持物状态。光线以正文为准，缺省时按时间和地点推定。相邻格保持人物和道具状态连续。';
     });
     const saveSceneGuide = button('保存场景规则', () => {
         config.sceneGuide = sceneGuide.value.trim();
@@ -943,7 +944,7 @@ async function openEditor(index) {
     const filterFields = el('fieldset', 'twc-filter-fields');
     filters.append(filterFields);
     const filterEnabled = toggle(filterFields, '启用消息过滤规则', config.filterStoryboardMessages);
-    filterFields.append(el('p', 'twc-help', '只处理待改编正文。留空的起止标记分别代表消息开头和末尾。两个标记都填写时，只有完整匹配的片段会被过滤。勾选「发给 AI」可将片段作为参考，图片只插在正文。'));
+    filterFields.append(el('p', 'twc-help', '成对标签如 <WorldState> 和 </WorldState> 可匹配大小写、属性和嵌套，未闭合的标签内容会保留。其他标记按原样匹配，留空代表消息开头或末尾。勾选「发给 AI」可将清理后的片段作为参考，图片只插在正文。'));
     const filterRows = el('div');
     filterFields.append(filterRows);
     const rowReaders = new Map();
@@ -962,10 +963,15 @@ async function openEditor(index) {
     filterActions.append(
         button('添加过滤规则', () => addFilterRow()),
         button('填入常见规则', () => {
-            const pairs = ['think', 'thinking', 'system', 'meta', 'options', 'WorldState', 'state', 'UpdateVariable'].map(tag => [`<${tag}>`, `</${tag}>`]);
+            const tags = [
+                'think', 'thinking', 'system', 'meta', 'options', 'WorldState', 'state', 'UpdateVariable', 'StatusBlock', 'StatusBar',
+                'dream_scene', 'dream_parallel_event', 'simple_thinking', 'dream_big_discuss',
+            ];
+            const pairs = tags.map(tag => [`<${tag}>`, `</${tag}>`]);
             pairs.push(['<!--', '-->']);
+            const existing = [...rowReaders.values()].map(read => read());
             for (const [start, end] of pairs) {
-                if (![...rowReaders.values()].some(read => read().start === start && read().end === end)) addFilterRow({ start, end });
+                if (!existing.some(rule => rule.start.toLowerCase() === start.toLowerCase() && rule.end.toLowerCase() === end.toLowerCase())) addFilterRow({ start, end });
             }
         }),
         button('保存过滤规则', () => {
@@ -1205,7 +1211,9 @@ async function openEditor(index) {
         record.pages = primaryPrompts(plan, mode, record.style, record.appearance, templates).map((prompt, i) => {
             const previous = record.pages[i];
             if (previous && (prompt === previous.prompt || (!applyTemplate && prompt === previousPrompts[i]))) return previous;
-            return { image: previous?.image, stale: Boolean(previous?.image), prompt, status: 'pending' };
+            const keepSkip = mode === 'single' && plan.pages[i].supplemental
+                && previousPlan.pages[i]?.supplemental && previousPlan.pages[i].title === plan.pages[i].title && previous?.skipInBatch;
+            return { image: previous?.image, stale: Boolean(previous?.image), prompt, status: 'pending', ...(keepSkip ? { skipInBatch: true } : {}) };
         });
         if (record.singlePages) {
             const previousFrames = singleFrames(previousPlan);
@@ -1305,13 +1313,13 @@ async function openEditor(index) {
         storyRail.replaceChildren(); storyPage.replaceChildren();
         const review = scenesToReview();
         for (const [i, page] of record.plan.pages.entries()) {
-            const item = button(`${i + 1}. ${page.title}${review.has(i) ? ' · 待修正' : ''}`, () => { selectedStory = i; renderStoryboard(); syncControls(); storyRail.querySelectorAll('button')[i]?.focus(); }, 'twc-story-link');
+            const item = button(`${i + 1}. ${page.title}${page.supplemental ? ' · 补充' : ''}${review.has(i) ? ' · 待修正' : ''}`, () => { selectedStory = i; renderStoryboard(); syncControls(); storyRail.querySelectorAll('button')[i]?.focus(); }, 'twc-story-link');
             item.setAttribute('aria-pressed', String(selectedStory === i)); storyRail.append(item);
         }
         storyRail.scrollLeft = scrollLeft; storyRail.scrollTop = scrollTop;
         const page = record.plan.pages[selectedStory];
         const label = mode === 'single' ? `第 ${selectedStory + 1} 格 · 整页单格` : `第 ${selectedStory + 1} 页 · ${page.panels.length} 格`;
-        storyPage.append(el('h3', '', page.title), el('p', 'twc-caption', label));
+        storyPage.append(el('h3', '', page.title), el('p', 'twc-caption', page.supplemental ? `${label} · 补充镜头` : label));
         if (record.plan.characters) {
             const cast = el('details', 'twc-disclosure'); cast.append(el('summary', '', '人物设定'), el('p', 'twc-story-text', record.plan.characters)); storyPage.append(cast);
         }
@@ -1319,9 +1327,9 @@ async function openEditor(index) {
             const card = el('section', 'twc-panel');
             card.append(el('h4', '', `第 ${i + 1} 格 · ${panel.layout}`));
             const issues = record.reviewScenes ? sceneIssues(panel.scene) : [];
-            if (issues.length) {
-                card.append(el('p', 'twc-warnings', issues.join('。')));
-                const edit = field(card, '修正这一格的画面描述', panel.scene); edit.rows = 4;
+            if (issues.length || page.supplemental) {
+                if (issues.length) card.append(el('p', 'twc-warnings', issues.join('。')));
+                const edit = field(card, issues.length ? '修正这一格的画面描述' : '补充镜头的画面描述', panel.scene); edit.rows = 4;
                 const pageIndex = selectedStory;
                 card.append(button('保存这一格', () => withBusy(async () => {
                     ensureFresh();
@@ -1335,6 +1343,9 @@ async function openEditor(index) {
             appendPanelText(card, panel);
             storyPage.append(card);
         }
+    }
+    function isBatchSkipped(page, index) {
+        return mode === 'single' && record.plan.pages[index]?.supplemental === true && page.skipInBatch === true;
     }
     function renderOutput() {
         const { scrollLeft, scrollTop } = thumbRail;
@@ -1350,8 +1361,10 @@ async function openEditor(index) {
         const frames = single ? singleFrames(record.plan) : [];
         const unit = single ? '格' : '页';
         const review = outputReview();
-        const completed = pictures.filter(page => safeImage(page.image) && !page.stale).length;
-        progress.textContent = `已完成 ${completed} / ${pictures.length} ${unit}${single ? ` · 预计 ${pictures.length} 张` : ''}`;
+        const included = pictures.filter((page, i) => !isBatchSkipped(page, i));
+        const completed = included.filter(page => safeImage(page.image) && !page.stale).length;
+        const skipped = pictures.length - included.length;
+        progress.textContent = `已完成 ${completed} / ${included.length} ${unit}${single ? ` · 预计 ${included.length} 张` : ''}${skipped ? ` · 跳过 ${skipped} 格补充镜头` : ''}`;
         for (const [i, page] of pictures.entries()) {
             const thumb = button('', () => { selectedOutput = i; renderOutput(); thumbRail.querySelectorAll('button')[i]?.focus(); }, 'twc-thumb');
             const state = review.has(i) ? '待修正' : page.status === 'generating' ? '生成中' : page.status === 'failed' ? '失败' : page.stale ? '待重画' : page.image ? '已生成' : '待生成';
@@ -1360,7 +1373,8 @@ async function openEditor(index) {
             if (safeImage(page.image)) {
                 const image = el('img', ''); image.src = page.image; image.alt = ''; image.loading = 'lazy'; thumb.append(image);
             }
-            thumb.append(el('span', '', `第 ${i + 1} ${unit}`), el('small', '', state)); thumbRail.append(thumb);
+            const extra = frames[i]?.page.supplemental ? ' · 补充' : '';
+            thumb.append(el('span', '', `第 ${i + 1} ${unit}${extra}`), el('small', '', isBatchSkipped(page, i) ? `${state} · 跳过批量` : state)); thumbRail.append(thumb);
         }
         thumbRail.scrollLeft = scrollLeft; thumbRail.scrollTop = scrollTop;
         const i = selectedOutput = Math.min(selectedOutput, pictures.length - 1);
@@ -1376,7 +1390,18 @@ async function openEditor(index) {
             link.href = imagePath; link.setAttribute('download', ''); pageActions.append(link);
         }
         pageActions.append(button(`${page.image ? '重画' : '生成'}这一${unit}`, () => generate(i)));
-        actions.append(el('h3', '', `${pageLabel} · ${title}`), pageActions);
+        const supplemental = frames[i]?.page.supplemental === true;
+        if (supplemental) {
+            const batchSkipped = isBatchSkipped(page, i);
+            pageActions.append(button(batchSkipped ? '加入批量出图' : '跳过批量出图', () => withBusy(async () => {
+                ensureFresh();
+                if (batchSkipped) delete page.skipInBatch;
+                else page.skipInBatch = true;
+                await persist();
+                renderOutput();
+            })));
+        }
+        actions.append(el('h3', '', `${pageLabel} · ${title}${supplemental ? ' · 补充镜头' : ''}`), pageActions);
         preview.append(actions);
         if (review.has(i)) {
             const from = legacyOutput ? `第 ${frames[i].pageIndex + 1} 页第 ${frames[i].panelIndex + 1} 格` : single ? '本格' : '本页';
@@ -1426,11 +1451,12 @@ async function openEditor(index) {
             const pictures = outputPictures();
             const unit = outputMode === 'single' ? '格' : '页';
             const review = outputReview();
-            const pending = pictures.map((page, i) => ({ page, i })).filter(({ page, i }) => forceIndex === null ? !page.image || page.stale : i === forceIndex);
+            const pending = pictures.map((page, i) => ({ page, i })).filter(({ page, i }) =>
+                forceIndex === null ? !isBatchSkipped(page, i) && (!page.image || page.stale) : i === forceIndex);
             const ready = pending.filter(({ i }) => !review.has(i));
             const blocked = pending.length - ready.length;
             if (!ready.length) {
-                status.textContent = blocked ? '待生成的页面需要先在「分镜」中修正画面描述。' : '所有页面均已生成。';
+                status.textContent = blocked ? '待生成的页面需要先在「分镜」中修正画面描述。' : '参与本次出图的画面均已生成。';
                 return;
             }
             if (ready.some(({ page }) => !page.prompt?.trim())) throw new Error('生图提示词不能为空。');
@@ -1455,7 +1481,7 @@ async function openEditor(index) {
                 renderRecentRequest();
                 return generateImage(context(), { backend, url: address, graph, prompt: page.prompt, seed, model: novelModel, filename });
             }, () => !halted && !owner.destroyed && runtime === owner && current(bound), {
-                forceIndex, skipPage: i => review.has(i), shouldStop: () => stopRequested, onUpdate: async (page, i) => {
+                forceIndex, skipPage: i => review.has(i) || (forceIndex === null && isBatchSkipped(pictures[i], i)), shouldStop: () => stopRequested, onUpdate: async (page, i) => {
                     ensureFresh();
                     const previous = previousImages.get(previousPaths[i]);
                     if (previous && page.status === 'done' && page.image !== previous.image) archiveImages(bound.message.extra[ID], [previous]);
